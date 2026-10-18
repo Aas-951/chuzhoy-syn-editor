@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src https://api.github.com; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#2563eb">
+<title>Чужой сын — редактор</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button id="back" class="icon" hidden aria-label="Назад">‹</button>
+  <h1 id="title">Чужой сын</h1>
+  <button id="sync" class="sync" aria-label="Синхронизировать"><span id="dot" class="dot"></span><span id="syncText">…</span></button>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<main id="view"></main>
+
+<nav id="tabs" class="tabs" hidden>
+  <button data-tab="read">Читать</button>
+  <button data-tab="edit">Править</button>
+  <button data-tab="notes">Заметки <span id="notesCount" class="count"></span></button>
+  <button data-tab="proposals">Предложения <span id="propCount" class="count"></span></button>
+  <button data-tab="history">Версии</button>
+</nav>
+
+<button id="addNote" class="fab" hidden>＋ Заметка</button>
+
+<dialog id="sheet" class="sheet"></dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

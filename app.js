@@ -1,0 +1,657 @@
+'use strict';
+// Редактор «Чужой сын». Без сервера: главы и заметки лежат в закрытом
+// репозитории GitHub, телефон держит копию у себя и отправляет очередь,
+// когда появляется сеть. Формат данных описан в редактор/README.md репозитория.
+
+const API = 'https://api.github.com';
+const branch = () => cfg.branch || 'main';   // другая ветка — только для проверки редактора
+const MANIFEST = 'редактор/главы.json';
+const PROPOSALS = 'редактор/предложения.json';
+const notesPath = id => `редактор/заметки/${id}.json`;
+const conflictPath = (id, stamp) => `редактор/конфликты/${id}-${stamp}.md`;
+
+const KEY = { cfg: 'cs.cfg', data: 'cs.data', queue: 'cs.queue', ui: 'cs.ui', draft: id => 'cs.draft.' + id };
+
+// ---------- хранилище ----------
+const load = (k, def) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { banner('Память телефона переполнена — правки могут не сохраниться.', true); return false; } };
+
+let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
+let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
+let queue = load(KEY.queue, []);
+let ui = load(KEY.ui, { size: 19 });
+let route = { screen: 'chapters', chapter: null, tab: 'read' };
+let syncing = false, syncError = null;
+const saveData = () => save(KEY.data, data);
+const saveQueue = () => save(KEY.queue, queue);
+
+// ---------- утилиты ----------
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const toLF = s => s.replace(/\r\n?/g, '\n');
+const fmtDate = iso => { if (!iso) return ''; const d = new Date(iso); return d.toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); };
+const uid = p => `${p}-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 8)}`;
+const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+const words = s => (s.match(/[\p{L}\p{N}]+(?:[-’'][\p{L}\p{N}]+)*/gu) || []).length;
+
+function b64decode(b64) {
+  const bin = atob(b64.replace(/\s/g, ''));
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+function b64encode(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+const encPath = p => p.split('/').map(encodeURIComponent).join('/');
+
+// ---------- GitHub ----------
+async function gh(path, opts = {}) {
+  const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', Authorization: 'Bearer ' + cfg.token };
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(API + path, { ...opts, headers, cache: 'no-store' });
+  if (!r.ok) {
+    const e = new Error(`GitHub ${r.status}`); e.status = r.status;
+    try { e.detail = (await r.json()).message; } catch {}
+    throw e;
+  }
+  return r.status === 204 ? null : r.json();
+}
+const repoPath = () => `/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}`;
+
+async function getFile(path, ref = branch()) {
+  try {
+    const j = await gh(`${repoPath()}/contents/${encPath(path)}?ref=${encodeURIComponent(ref)}`);
+    return { sha: j.sha, text: b64decode(j.content) };
+  } catch (e) { if (e.status === 404) return null; throw e; }
+}
+async function putFile(path, text, sha, message) {
+  const body = { message, content: b64encode(text), branch: branch() };
+  if (sha) body.sha = sha;
+  const j = await gh(`${repoPath()}/contents/${encPath(path)}`, { method: 'PUT', body: JSON.stringify(body) });
+  data.files[path] = { sha: j.content.sha, text };
+  saveData();
+  return j.content.sha;
+}
+async function getBlob(sha) { return b64decode((await gh(`${repoPath()}/git/blobs/${sha}`)).content); }
+
+// ---------- модель ----------
+const parseJSON = (text, def) => { try { return JSON.parse(text); } catch { return def; } };
+const manifest = () => parseJSON(data.files[MANIFEST]?.text || '', { chapters: [] });
+const chapters = () => manifest().chapters || [];
+const chapterById = id => chapters().find(c => c.id === id);
+const eolOf = raw => (raw && raw.includes('\r\n')) ? '\r\n' : '\n';
+const withEol = (lf, eol) => eol === '\r\n' ? lf.replace(/\n/g, '\r\n') : lf;
+
+function serverChapter(ch) { const f = data.files[ch.file]; return f ? toLF(f.text) : null; }
+function pendingEdit(id) { return queue.find(o => o.type === 'edit' && o.chapter === id); }
+function pendingAccept(id) { return queue.find(o => o.type === 'decide' && o.chapter === id && o.decision === 'accepted'); }
+function chapterText(ch) {
+  const ed = pendingEdit(ch.id); if (ed) return ed.text;
+  const acc = pendingAccept(ch.id); if (acc) return acc.text;
+  return serverChapter(ch);
+}
+
+function applyNoteOps(notes, chapterId) {
+  const list = JSON.parse(JSON.stringify(notes));
+  for (const op of queue) {
+    if (op.chapter !== chapterId) continue;
+    if (op.type === 'note-add' && !list.some(n => n.id === op.note.id)) list.push(op.note);
+    if (op.type === 'note-set') { const n = list.find(n => n.id === op.id); if (n) Object.assign(n, op.fields); }
+    if (op.type === 'note-reply') { const n = list.find(n => n.id === op.id); if (n) { n.replies = n.replies || []; if (!n.replies.some(r => r.id === op.reply.id)) n.replies.push(op.reply); } }
+  }
+  return list;
+}
+const serverNotes = id => parseJSON(data.files[notesPath(id)]?.text || '', { notes: [] }).notes || [];
+const notesOf = id => applyNoteOps(serverNotes(id), id);
+const openNotes = id => notesOf(id).filter(n => n.status === 'open');
+
+const proposalsAll = () => parseJSON(data.files[PROPOSALS]?.text || '', { proposals: [] }).proposals || [];
+function proposalsOf(id) {
+  return proposalsAll().filter(p => p.chapter === id).map(p => {
+    const op = queue.find(o => o.type === 'decide' && o.id === p.id);
+    return op ? { ...p, status: op.decision, local: true } : p;
+  });
+}
+
+// ---------- очередь ----------
+function enqueue(op) {
+  op.at = new Date().toISOString();
+  if (op.type === 'edit') {
+    const prev = pendingEdit(op.chapter);
+    if (prev) { prev.text = op.text; prev.at = op.at; } else queue.push(op);
+  } else queue.push(op);
+  saveQueue(); render(); scheduleSync(2500);
+}
+
+// ---------- синхронизация ----------
+let syncTimer = null;
+function scheduleSync(ms) { clearTimeout(syncTimer); syncTimer = setTimeout(sync, ms); }
+
+async function sync() {
+  if (syncing || !cfg.token || !navigator.onLine) { renderStatus(); return; }
+  syncing = true; syncError = null; renderStatus();
+  try {
+    await pushQueue();
+    await pull();
+    data.syncedAt = new Date().toISOString(); saveData();
+  } catch (e) {
+    syncError = e.status === 401 ? 'Ключ GitHub не подходит или истёк — откройте «Настройки».'
+      : e.status === 403 || e.status === 404 ? 'Нет доступа к репозиторию — проверьте «Настройки».'
+      : (navigator.onLine ? 'Не получилось синхронизировать: ' + (e.detail || e.message) : null);
+  } finally { syncing = false; render(); }
+}
+
+async function pushQueue() {
+  // 1. Правки глав
+  for (const op of queue.filter(o => o.type === 'edit')) {
+    const ch = chapterById(op.chapter); if (!ch) { drop(op); continue; }
+    const cur = await getFile(ch.file);
+    const eol = eolOf(cur ? cur.text : data.files[ch.file]?.text);
+    if (cur && cur.sha !== op.base) {
+      // Глава изменилась на сервере, пока вы правили без сети: ничего не затираем.
+      const path = conflictPath(ch.id, stamp());
+      await putFile(path, withEol(op.text, eol), null, `Конфликт: правка с телефона сохранена отдельно (${ch.title})`);
+      addConflict({ chapter: ch.id, path, at: new Date().toISOString() });
+    } else {
+      await putFile(ch.file, withEol(op.text, eol), cur ? cur.sha : undefined, `Правка с телефона: ${ch.title}`);
+    }
+    drop(op);
+  }
+  // 2. Решения по предложениям
+  for (const op of queue.filter(o => o.type === 'decide')) {
+    const ch = chapterById(op.chapter);
+    let decision = op.decision;
+    if (decision === 'accepted' && ch) {
+      const cur = await getFile(ch.file);
+      if (!cur || cur.sha !== op.base) decision = 'stale';
+      else await putFile(ch.file, withEol(op.text, eolOf(cur.text)), cur.sha, `Принято предложение ${op.id}: ${ch.title}`);
+    }
+    await updateJSON(PROPOSALS, { proposals: [] }, j => {
+      const p = (j.proposals || []).find(p => p.id === op.id);
+      if (p) { p.status = decision; p.decidedAt = op.at; }
+    }, `Решение по предложению ${op.id}: ${decision}`);
+    if (decision === 'stale') banner('Глава изменилась после того, как агент подготовил предложение. Предложение не применено — попросите агента обновить его.', true);
+    drop(op);
+  }
+  // 3. Заметки — одним сохранением на главу
+  const byChapter = [...new Set(queue.filter(o => o.type.startsWith('note-')).map(o => o.chapter))];
+  for (const id of byChapter) {
+    const ops = queue.filter(o => o.chapter === id && o.type.startsWith('note-'));
+    await updateJSON(notesPath(id), { chapter: id, notes: [] }, j => {
+      j.notes = j.notes || [];
+      for (const op of ops) {
+        if (op.type === 'note-add' && !j.notes.some(n => n.id === op.note.id)) j.notes.push(op.note);
+        const n = j.notes.find(n => n.id === op.id);
+        if (op.type === 'note-set' && n) Object.assign(n, op.fields);
+        if (op.type === 'note-reply' && n) { n.replies = n.replies || []; if (!n.replies.some(r => r.id === op.reply.id)) n.replies.push(op.reply); }
+      }
+    }, `Заметки с телефона: ${chapterById(id)?.title || id}`);
+    ops.forEach(drop);
+  }
+}
+function drop(op) { queue = queue.filter(o => o !== op); saveQueue(); }
+
+async function updateJSON(path, def, mutate, message) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cur = await getFile(path);
+    const j = cur ? parseJSON(toLF(cur.text), def) : JSON.parse(JSON.stringify(def));
+    mutate(j);
+    try { return await putFile(path, JSON.stringify(j, null, 2) + '\n', cur?.sha, message); }
+    catch (e) { if (e.status !== 409 && e.status !== 422) throw e; }
+  }
+  throw new Error('файл постоянно меняется, попробуйте позже');
+}
+
+async function pull() {
+  const tree = await gh(`${repoPath()}/git/trees/${encodeURIComponent(branch())}?recursive=1`);
+  const sha = new Map(tree.tree.filter(t => t.type === 'blob').map(t => [t.path, t.sha]));
+  const fetchIfChanged = async path => {
+    const s = sha.get(path);
+    if (!s) { delete data.files[path]; return; }
+    if (data.files[path]?.sha === s) return;
+    data.files[path] = { sha: s, text: await getBlob(s) };
+  };
+  await fetchIfChanged(MANIFEST);
+  await fetchIfChanged(PROPOSALS);
+  const want = new Set([MANIFEST, PROPOSALS]);
+  for (const ch of chapters()) { want.add(ch.file); want.add(notesPath(ch.id)); }
+  for (const p of proposalsAll()) if (p.status === 'pending') want.add(p.file);
+  for (const c of data.conflicts || []) want.add(c.path);
+  for (const path of want) await fetchIfChanged(path);
+  for (const path of Object.keys(data.files)) if (!want.has(path)) delete data.files[path];
+  saveData();
+}
+
+function addConflict(c) { data.conflicts = data.conflicts || []; data.conflicts.push(c); saveData(); }
+
+// ---------- интерфейс ----------
+function banner(html, bad) {
+  const b = $('#banner'); if (!html) { b.hidden = true; return; }
+  b.innerHTML = html; b.className = 'banner' + (bad ? ' bad' : ''); b.hidden = false;
+}
+
+function renderStatus() {
+  const dot = $('#dot'), t = $('#syncText');
+  const n = queue.length;
+  if (syncing) { dot.className = 'dot busy'; t.textContent = 'Синхронизация…'; return; }
+  if (!cfg.token) { dot.className = 'dot err'; t.textContent = 'Настройки'; return; }
+  if (!navigator.onLine) { dot.className = 'dot off'; t.textContent = n ? `Без сети · ждут: ${n}` : 'Без сети'; return; }
+  if (syncError) { dot.className = 'dot err'; t.textContent = n ? `Ошибка · ждут: ${n}` : 'Ошибка'; return; }
+  dot.className = 'dot on'; t.textContent = n ? `Ждут: ${n}` : 'Всё отправлено';
+}
+
+function go(r) { route = { ...route, ...r }; window.scrollTo(0, 0); render(); }
+
+function render() {
+  renderStatus();
+  const msgs = [];
+  if (syncError) msgs.push(esc(syncError));
+  for (const c of data.conflicts || []) {
+    const ch = chapterById(c.chapter);
+    msgs.push(`Конфликт в «${esc(ch?.title || c.chapter)}»: глава изменилась, пока вы правили без сети. Ваша версия сохранена отдельно. <button data-conflict="${esc(c.path)}">Открыть</button>`);
+  }
+  banner(msgs.join('<br>'), !!syncError || msgs.length > 0);
+  document.querySelectorAll('[data-conflict]').forEach(b => b.onclick = () => openConflict(b.dataset.conflict));
+
+  const inChapter = route.screen === 'chapter' && chapterById(route.chapter);
+  $('#tabs').hidden = !inChapter;
+  $('#back').hidden = route.screen === 'chapters';
+  $('#addNote').hidden = true;
+  if (route.screen === 'settings') return renderSettings();
+  if (!cfg.token) return renderSettings();
+  if (!inChapter) return renderChapters();
+  const ch = chapterById(route.chapter);
+  $('#title').textContent = ch.title;
+  $('#notesCount').textContent = openNotes(ch.id).length || '';
+  $('#propCount').textContent = proposalsOf(ch.id).filter(p => p.status === 'pending').length || '';
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === route.tab));
+  ({ read: renderRead, edit: renderEdit, notes: renderNotes, proposals: renderProposals, history: renderHistory })[route.tab](ch);
+}
+
+function renderChapters() {
+  $('#title').textContent = 'Чужой сын';
+  const list = chapters();
+  const v = $('#view');
+  if (!list.length) {
+    v.innerHTML = `<div class="empty">${data.syncedAt ? 'В репозитории нет файла редактор/главы.json.' : 'Главы ещё не загружены. Нужен Интернет для первой загрузки.'}</div>
+      <div class="row end"><button class="btn" id="toSettings">Настройки</button></div>`;
+    $('#toSettings').onclick = () => go({ screen: 'settings' });
+    return;
+  }
+  v.innerHTML = `<div class="list">${list.map(ch => {
+    const text = chapterText(ch);
+    const on = openNotes(ch.id).length, pr = proposalsOf(ch.id).filter(p => p.status === 'pending').length;
+    const badges = [
+      ch.status ? `<span class="badge ${ch.status === 'черновик' ? 'draft' : ''}">${esc(ch.status)}</span>` : '',
+      pendingEdit(ch.id) ? '<span class="badge pending">не отправлено</span>' : '',
+    ].join('');
+    const info = [text ? `${words(text).toLocaleString('ru-RU')} слов` : 'не загружена', on ? `заметок: ${on}` : '', pr ? `предложений: ${pr}` : ''].filter(Boolean).join(' · ');
+    return `<button class="item" data-ch="${esc(ch.id)}"><div class="t">${esc(ch.title)}${badges}</div><div class="s">${info}</div></button>`;
+  }).join('')}</div>
+  <p class="hint">${data.syncedAt ? 'Обновлено: ' + fmtDate(data.syncedAt) : ''}</p>
+  <div class="row end"><button class="btn" id="toSettings">Настройки</button></div>`;
+  v.querySelectorAll('[data-ch]').forEach(b => b.onclick = () => go({ screen: 'chapter', chapter: b.dataset.ch, tab: 'read', proposal: null, version: null }));
+  $('#toSettings').onclick = () => go({ screen: 'settings' });
+}
+
+// --- чтение ---
+function mdToHtml(text) {
+  const inline = s => esc(s).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+  return toLF(text).split(/\n{2,}/).map(b => b.trim()).filter(Boolean).map(b => {
+    if (/^\*\s*\*\s*\*$|^-{3,}$/.test(b)) return '<div class="sep">* * *</div>';
+    const h = b.match(/^(#{1,3})\s+(.*)$/);
+    if (h) return `<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`;
+    return `<p>${inline(b).replace(/\n/g, '<br>')}</p>`;
+  }).join('');
+}
+
+function renderRead(ch) {
+  const text = chapterText(ch);
+  const v = $('#view');
+  if (text == null) { v.innerHTML = '<div class="empty">Глава ещё не загружена — нужен Интернет.</div>'; return; }
+  v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button></div>
+    ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
+    <article class="article" id="article">${mdToHtml(text)}</article>`;
+  document.documentElement.style.setProperty('--read-size', ui.size + 'px');
+  $('#smaller').onclick = () => { ui.size = Math.max(14, ui.size - 1); save(KEY.ui, ui); document.documentElement.style.setProperty('--read-size', ui.size + 'px'); };
+  $('#bigger').onclick = () => { ui.size = Math.min(28, ui.size + 1); save(KEY.ui, ui); document.documentElement.style.setProperty('--read-size', ui.size + 'px'); };
+  highlightNotes(ch);
+  if (route.scrollTo) { const id = route.scrollTo; route.scrollTo = null; scrollToNote(ch, id); }
+}
+
+const norm = s => s.replace(/\s+/g, ' ').trim();
+function findRange(root, quote, prefix) {
+  const q = norm(quote); if (!q) return null;
+  for (const el of root.querySelectorAll('p, h1, h2, h3')) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const nodes = []; let full = '';
+    while (walker.nextNode()) { nodes.push({ node: walker.currentNode, start: full.length }); full += walker.currentNode.data; }
+    const flat = full.replace(/\s/g, ' ');
+    let idx = -1, from = 0;
+    while ((from = flat.indexOf(q, from)) !== -1) {
+      if (!prefix || norm(flat.slice(Math.max(0, from - 60), from)).endsWith(norm(prefix).slice(-20))) { idx = from; break; }
+      if (idx === -1) idx = from; from++;
+    }
+    if (idx === -1) continue;
+    const at = pos => { const n = nodes.findLast(n => n.start <= pos) || nodes[0]; return [n.node, Math.min(pos - n.start, n.node.data.length)]; };
+    const r = document.createRange();
+    r.setStart(...at(idx)); r.setEnd(...at(idx + q.length));
+    return r;
+  }
+  return null;
+}
+function highlightNotes(ch) {
+  if (!window.CSS?.highlights || typeof Highlight === 'undefined') return;
+  const art = $('#article'); if (!art) return;
+  const ranges = openNotes(ch.id).map(n => findRange(art, n.quote, n.prefix)).filter(Boolean);
+  CSS.highlights.set('note', new Highlight(...ranges));
+}
+function scrollToNote(ch, id) {
+  const n = notesOf(ch.id).find(n => n.id === id); const art = $('#article');
+  const r = n && art && findRange(art, n.quote, n.prefix);
+  if (!r) return;
+  const el = r.startContainer.parentElement.closest('p, h1, h2, h3');
+  el.scrollIntoView({ block: 'center' }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1700);
+}
+
+// Выделение текста → заметка
+let selectionInfo = null;
+document.addEventListener('selectionchange', () => {
+  const fab = $('#addNote');
+  if (route.screen !== 'chapter' || route.tab !== 'read') { fab.hidden = true; return; }
+  const sel = getSelection(), art = $('#article');
+  const quote = sel && sel.rangeCount ? sel.toString().trim() : '';
+  if (!quote || !art || !art.contains(sel.getRangeAt(0).commonAncestorContainer)) { fab.hidden = true; return; }
+  const r = sel.getRangeAt(0);
+  const block = r.startContainer.parentElement?.closest('p, h1, h2, h3');
+  let prefix = '';
+  if (block) { const pre = document.createRange(); pre.selectNodeContents(block); pre.setEnd(r.startContainer, r.startOffset); prefix = norm(pre.toString()).slice(-40); }
+  selectionInfo = { quote, prefix };
+  fab.hidden = false;
+});
+$('#addNote').onclick = () => { if (selectionInfo) noteSheet(chapterById(route.chapter), selectionInfo); };
+
+function noteSheet(ch, { quote, prefix }) {
+  const d = $('#sheet');
+  d.innerHTML = `<h3>Новая заметка</h3>
+    ${quote ? `<div class="q">${esc(quote)}</div>` : '<p class="hint">Заметка ко всей главе.</p>'}
+    <div class="seg">
+      <label><input type="radio" name="type" value="remark" checked>Замечание</label>
+      <label><input type="radio" name="type" value="question">Вопрос агенту</label>
+    </div>
+    <textarea id="noteText" placeholder="Что не так или что спросить…"></textarea>
+    <p class="hint">Замечание — что поправить. Вопрос — агент ответит прямо в заметке.</p>
+    <div class="row end"><button class="btn" id="cancel">Отмена</button><button class="btn primary" id="ok">Сохранить</button></div>`;
+  d.showModal();
+  $('#cancel').onclick = () => d.close();
+  $('#ok').onclick = () => {
+    const comment = $('#noteText').value.trim(); if (!comment) return $('#noteText').focus();
+    const f = data.files[ch.file];
+    enqueue({ type: 'note-add', chapter: ch.id, note: {
+      id: uid('n'), type: d.querySelector('input[name=type]:checked').value, status: 'open',
+      quote, prefix, comment, author: 'автор', createdAt: new Date().toISOString(),
+      chapterSha: pendingEdit(ch.id) ? null : f?.sha || null, replies: [],
+    } });
+    d.close(); getSelection().removeAllRanges(); $('#addNote').hidden = true;
+  };
+}
+
+// --- правка ---
+function renderEdit(ch) {
+  const v = $('#view');
+  const base = chapterText(ch);
+  if (base == null) { v.innerHTML = '<div class="empty">Глава ещё не загружена — нужен Интернет.</div>'; return; }
+  if (pendingAccept(ch.id)) { v.innerHTML = '<div class="empty">Вы приняли предложение, оно ещё не отправлено. Править можно после синхронизации.</div>'; return; }
+  const draft = load(KEY.draft(ch.id), null);
+  const text = draft ?? base;
+  v.innerHTML = `${draft != null && draft !== base ? '<p class="hint">Восстановлен несохранённый черновик с этого телефона.</p>' : ''}
+    <textarea class="editor" id="ed" spellcheck="true"></textarea>
+    <p class="hint" id="wc"></p>
+    <div class="row end"><button class="btn danger" id="discard">Отменить правки</button><button class="btn primary" id="saveEd">Сохранить</button></div>
+    <p class="hint">«Сохранить» записывает правку на телефоне и отправляет её в GitHub, как только будет Интернет. Старая версия остаётся во вкладке «Версии».</p>`;
+  const ed = $('#ed'); ed.value = text;
+  const wc = () => $('#wc').textContent = `${words(ed.value).toLocaleString('ru-RU')} слов`;
+  wc();
+  let t; ed.oninput = () => { wc(); clearTimeout(t); t = setTimeout(() => save(KEY.draft(ch.id), ed.value), 400); };
+  $('#discard').onclick = () => { if (confirm('Отменить несохранённые правки?')) { localStorage.removeItem(KEY.draft(ch.id)); render(); } };
+  $('#saveEd').onclick = () => {
+    const value = ed.value;
+    if (value === base) { localStorage.removeItem(KEY.draft(ch.id)); return go({ tab: 'read' }); }
+    const prev = pendingEdit(ch.id);
+    enqueue({ type: 'edit', chapter: ch.id, base: prev ? prev.base : data.files[ch.file]?.sha, text: value });
+    localStorage.removeItem(KEY.draft(ch.id));
+    go({ tab: 'read' });
+  };
+}
+
+// --- заметки ---
+const WHO = { remark: 'Замечание', question: 'Вопрос' };
+const STATUS = { open: 'открыта', done: 'готово', rejected: 'отклонена' };
+function renderNotes(ch) {
+  const v = $('#view');
+  const filter = route.noteFilter || 'open';
+  const all = notesOf(ch.id).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  const shown = all.filter(n => filter === 'all' || (filter === 'open' ? n.status === 'open' : n.status !== 'open'));
+  const pendingIds = new Set(queue.filter(o => o.chapter === ch.id && o.type.startsWith('note-')).map(o => o.note?.id || o.id));
+  v.innerHTML = `<div class="filters">
+      ${[['open', 'Открытые'], ['closed', 'Закрытые'], ['all', 'Все']].map(([k, l]) => `<button data-f="${k}" class="${k === filter ? 'on' : ''}">${l}</button>`).join('')}
+      <span class="grow"></span><button class="btn" id="noteAll">＋ К главе</button>
+    </div>
+    ${shown.length ? '' : '<div class="empty">Заметок нет. Выделите текст во вкладке «Читать», чтобы оставить заметку.</div>'}
+    ${shown.map(n => `<div class="note ${n.status !== 'open' ? 'done' : ''}">
+      <div class="row"><span class="type ${n.type}">${WHO[n.type] || n.type}</span><span class="meta">${fmtDate(n.createdAt)} · ${STATUS[n.status] || n.status}${pendingIds.has(n.id) ? ' · не отправлено' : ''}</span></div>
+      ${n.quote ? `<div class="q" data-goto="${esc(n.id)}">${esc(n.quote)}</div>` : ''}
+      <div class="c">${esc(n.comment)}</div>
+      ${(n.replies || []).map(r => `<div class="reply"><div class="who">${esc(r.by)} · <span class="meta">${fmtDate(r.at)}</span></div>${esc(r.text)}</div>`).join('')}
+      <div class="row end mt">
+        <button class="btn" data-reply="${esc(n.id)}">Ответить</button>
+        ${n.status === 'open' ? `<button class="btn" data-close="${esc(n.id)}">Закрыть</button>` : `<button class="btn" data-reopen="${esc(n.id)}">Открыть снова</button>`}
+      </div></div>`).join('')}`;
+  v.querySelectorAll('[data-f]').forEach(b => b.onclick = () => go({ noteFilter: b.dataset.f }));
+  $('#noteAll').onclick = () => noteSheet(ch, { quote: '', prefix: '' });
+  v.querySelectorAll('[data-goto]').forEach(b => b.onclick = () => go({ tab: 'read', scrollTo: b.dataset.goto }));
+  v.querySelectorAll('[data-close]').forEach(b => b.onclick = () => enqueue({ type: 'note-set', chapter: ch.id, id: b.dataset.close, fields: { status: 'done', closedAt: new Date().toISOString() } }));
+  v.querySelectorAll('[data-reopen]').forEach(b => b.onclick = () => enqueue({ type: 'note-set', chapter: ch.id, id: b.dataset.reopen, fields: { status: 'open' } }));
+  v.querySelectorAll('[data-reply]').forEach(b => b.onclick = () => replySheet(ch, b.dataset.reply));
+}
+function replySheet(ch, id) {
+  const d = $('#sheet');
+  d.innerHTML = `<h3>Ответ</h3><textarea id="rt"></textarea>
+    <div class="row end"><button class="btn" id="cancel">Отмена</button><button class="btn primary" id="ok">Сохранить</button></div>`;
+  d.showModal();
+  $('#cancel').onclick = () => d.close();
+  $('#ok').onclick = () => {
+    const text = $('#rt').value.trim(); if (!text) return;
+    enqueue({ type: 'note-reply', chapter: ch.id, id, reply: { id: uid('r'), by: 'автор', at: new Date().toISOString(), text } });
+    d.close();
+  };
+}
+
+// --- предложения ---
+const PSTATUS = { pending: 'ждёт решения', accepted: 'принято', rejected: 'отклонено', stale: 'устарело' };
+function renderProposals(ch) {
+  const v = $('#view');
+  const list = proposalsOf(ch.id).sort((a, b) => (b.at || '').localeCompare(a.at || ''));
+  if (route.proposal) {
+    const p = list.find(p => p.id === route.proposal);
+    const text = p && data.files[p.file] ? toLF(data.files[p.file].text) : null;
+    const cur = chapterText(ch);
+    if (!p || text == null) { v.innerHTML = '<div class="empty">Текст предложения не загружен — нужен Интернет.</div><div class="row"><button class="btn" id="pback">‹ Назад</button></div>'; $('#pback').onclick = () => go({ proposal: null }); return; }
+    const stale = p.base !== data.files[ch.file]?.sha || !!pendingEdit(ch.id);
+    v.innerHTML = `<div class="row"><button class="btn" id="pback">‹ Все предложения</button></div>
+      <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
+      <div class="c">${esc(p.summary || '')}</div>
+      ${stale && p.status === 'pending' ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
+      <p class="hint"><ins class="diff">зелёное</ins> — добавлено, <del>красное</del> — убрано. Неизменённые абзацы свёрнуты.</p>
+      <div class="diff">${diffHtml(cur || '', text)}</div>
+      ${p.status === 'pending' ? `<div class="row end mt">
+        <button class="btn danger" id="reject">Отклонить</button>
+        <button class="btn primary" id="accept" ${stale ? 'disabled' : ''}>Принять</button></div>` : `<p class="hint">Статус: ${PSTATUS[p.status] || p.status}</p>`}`;
+    $('#pback').onclick = () => go({ proposal: null });
+    if (p.status === 'pending') {
+      $('#reject').onclick = () => { if (confirm('Отклонить предложение?')) { enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' }); go({ proposal: null }); } };
+      $('#accept').onclick = () => { if (confirm('Принять предложение? Текущий текст останется во вкладке «Версии».')) { enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'accepted', base: p.base, text }); go({ proposal: null, tab: 'read' }); } };
+    }
+    return;
+  }
+  v.innerHTML = list.length ? `<div class="list">${list.map(p => `<button class="item" data-p="${esc(p.id)}">
+      <div class="t">${esc(p.by || 'Агент')}<span class="badge ${p.status === 'pending' ? 'pending' : ''}">${PSTATUS[p.status] || p.status}${p.local ? ', не отправлено' : ''}</span></div>
+      <div class="s">${fmtDate(p.at)} — ${esc((p.summary || '').slice(0, 160))}</div></button>`).join('')}</div>`
+    : '<div class="empty">Предложений нет. Попросите агента в T3: «обработай заметки к этой главе».</div>';
+  v.querySelectorAll('[data-p]').forEach(b => b.onclick = () => go({ proposal: b.dataset.p }));
+}
+
+// Сравнение: по абзацам, внутри изменённых — по словам.
+function lcs(a, b, eq = (x, y) => x === y) {
+  const n = a.length, m = b.length, dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = eq(a[i], b[j]) ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = []; let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (eq(a[i], b[j])) { out.push(['=', a[i], b[j]]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) out.push(['-', a[i++]]);
+    else out.push(['+', b[j++]]);
+  }
+  while (i < n) out.push(['-', a[i++]]); while (j < m) out.push(['+', b[j++]]);
+  return out;
+}
+function wordDiff(a, b) {
+  const ta = a.split(/(\s+)/), tb = b.split(/(\s+)/);
+  if (ta.length * tb.length > 4e6) return `<del>${esc(a)}</del> <ins>${esc(b)}</ins>`;
+  return lcs(ta, tb).map(([k, x]) => k === '=' ? esc(x) : k === '-' ? `<del>${esc(x)}</del>` : `<ins>${esc(x)}</ins>`).join('');
+}
+function diffHtml(oldText, newText) {
+  const pa = toLF(oldText).split(/\n{2,}/), pb = toLF(newText).split(/\n{2,}/);
+  const ops = lcs(pa, pb);
+  const html = []; let sameRun = 0;
+  const flushSame = () => { if (sameRun) html.push(`<div class="gap">… без изменений: ${sameRun} абз. …</div>`); sameRun = 0; };
+  for (let k = 0; k < ops.length; k++) {
+    const [t, x] = ops[k];
+    if (t === '=') { sameRun++; continue; }
+    flushSame();
+    if (t === '-' && ops[k + 1]?.[0] === '+') { html.push(`<p>${wordDiff(x, ops[k + 1][1])}</p>`); k++; }
+    else html.push(t === '-' ? `<p><del>${esc(x)}</del></p>` : `<p><ins>${esc(x)}</ins></p>`);
+  }
+  flushSame();
+  return html.join('') || '<div class="empty">Текст не отличается.</div>';
+}
+
+// --- версии ---
+async function renderHistory(ch) {
+  const v = $('#view');
+  if (!navigator.onLine) { v.innerHTML = '<div class="empty">Версии доступны только с Интернетом. Каждая сохранённая правка хранится в GitHub.</div>'; return; }
+  if (route.version) {
+    v.innerHTML = '<div class="empty">Загружаю…</div>';
+    try {
+      const f = await getFile(ch.file, route.version.sha);
+      const text = f ? toLF(f.text) : '';
+      v.innerHTML = `<div class="row"><button class="btn" id="vback">‹ Все версии</button><span class="grow"></span><button class="btn" id="restore">Вернуть эту версию</button></div>
+        <p class="hint">${esc(route.version.msg)} · ${fmtDate(route.version.date)}</p>
+        <details><summary class="hint">Чем отличается от текущего текста</summary><div class="diff">${diffHtml(chapterText(ch) || '', text)}</div></details>
+        <article class="article">${mdToHtml(text)}</article>`;
+      $('#vback').onclick = () => go({ version: null });
+      $('#restore').onclick = () => {
+        if (!confirm('Вернуть главу к этой версии? Текущий текст тоже останется в истории.')) return;
+        const prev = pendingEdit(ch.id);
+        enqueue({ type: 'edit', chapter: ch.id, base: prev ? prev.base : data.files[ch.file]?.sha, text });
+        go({ version: null, tab: 'read' });
+      };
+    } catch (e) { v.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(e.detail || e.message)}</div>`; }
+    return;
+  }
+  v.innerHTML = '<div class="empty">Загружаю историю…</div>';
+  try {
+    const list = await gh(`${repoPath()}/commits?path=${encodeURIComponent(ch.file)}&sha=${encodeURIComponent(branch())}&per_page=40`);
+    v.innerHTML = `<div class="list">${list.map(c => `<button class="item" data-v="${esc(c.sha)}" data-msg="${esc(c.commit.message.split('\n')[0])}" data-date="${esc(c.commit.author.date)}">
+      <div class="t">${esc(c.commit.message.split('\n')[0])}</div><div class="s">${fmtDate(c.commit.author.date)}</div></button>`).join('')}</div>`;
+    v.querySelectorAll('[data-v]').forEach(b => b.onclick = () => go({ version: { sha: b.dataset.v, msg: b.dataset.msg, date: b.dataset.date } }));
+  } catch (e) { v.innerHTML = `<div class="empty">Не удалось загрузить историю: ${esc(e.detail || e.message)}</div>`; }
+}
+
+async function openConflict(path) {
+  const c = (data.conflicts || []).find(c => c.path === path); if (!c) return;
+  const ch = chapterById(c.chapter);
+  const mine = data.files[path] ? toLF(data.files[path].text) : null;
+  const d = $('#sheet');
+  d.innerHTML = `<h3>Конфликт: ${esc(ch?.title || c.chapter)}</h3>
+    <p class="hint">Пока вы правили без сети, глава изменилась в GitHub. Ваша версия сохранена в файле ${esc(path)}. Ниже — чем ваша версия отличается от текущей.</p>
+    <div class="diff scroll">${mine != null && ch ? diffHtml(serverChapter(ch) || '', mine) : 'Файл ещё не загружен.'}</div>
+    <div class="row end mt">
+      <button class="btn" id="cl">Закрыть</button>
+      <button class="btn" id="keep">Оставить текущую</button>
+      <button class="btn primary" id="mine" ${mine == null ? 'disabled' : ''}>Взять мою</button></div>
+    <p class="hint">Можно и не решать сейчас — попросите агента свести обе версии.</p>`;
+  d.showModal();
+  const resolve = () => { data.conflicts = data.conflicts.filter(x => x !== c); saveData(); d.close(); render(); };
+  $('#cl').onclick = () => d.close();
+  $('#keep').onclick = resolve;
+  $('#mine').onclick = () => { enqueue({ type: 'edit', chapter: ch.id, base: data.files[ch.file]?.sha, text: mine }); resolve(); };
+}
+
+// --- настройки ---
+function renderSettings() {
+  $('#title').textContent = 'Настройки';
+  $('#tabs').hidden = true; $('#back').hidden = !cfg.token;
+  const v = $('#view');
+  v.innerHTML = `<div class="form">
+    <p>Редактор хранит главы на телефоне и синхронизирует их с вашим закрытым репозиторием GitHub. Для этого нужен ключ доступа — один раз.</p>
+    <ol class="steps">
+      <li>Откройте <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com → новый ключ</a> (войдите в аккаунт).</li>
+      <li>Token name: <b>Редактор телефон</b>. Expiration: <b>1 год</b> (или без срока).</li>
+      <li>Repository access: <b>Only select repositories</b> → <b>${esc(cfg.repo)}</b>.</li>
+      <li>Permissions → Repository → <b>Contents: Read and write</b>.</li>
+      <li>Нажмите <b>Generate token</b>, скопируйте ключ и вставьте ниже.</li>
+    </ol>
+    <label class="f" for="tok">Ключ GitHub</label>
+    <input id="tok" type="password" autocomplete="off" placeholder="github_pat_…" value="${esc(cfg.token)}">
+    <label class="f" for="own">Владелец</label><input id="own" type="text" value="${esc(cfg.owner)}">
+    <label class="f" for="rep">Репозиторий</label><input id="rep" type="text" value="${esc(cfg.repo)}">
+    <div class="row end mt">
+      ${cfg.token ? '<button class="btn danger" id="logout">Выйти и стереть с телефона</button>' : ''}
+      <button class="btn primary" id="check">Сохранить и проверить</button>
+    </div>
+    <p id="res"></p>
+    <p class="hint">Ключ хранится только на этом телефоне и даёт доступ только к одному репозиторию. Если телефон потеряется — удалите ключ на github.com/settings/personal-access-tokens.</p>
+  </div>`;
+  $('#check').onclick = async () => {
+    cfg = { ...cfg, owner: $('#own').value.trim(), repo: $('#rep').value.trim(), token: $('#tok').value.trim() };
+    save(KEY.cfg, cfg);
+    const res = $('#res'); res.className = ''; res.textContent = 'Проверяю…';
+    try {
+      const r = await gh(repoPath());
+      if (!r.permissions?.push) { res.className = 'bad'; res.textContent = 'Ключ даёт только чтение. Включите Contents: Read and write.'; return; }
+      res.className = 'ok'; res.textContent = 'Готово, доступ есть. Загружаю главы…';
+      syncError = null; await sync(); go({ screen: 'chapters' });
+    } catch (e) {
+      res.className = 'bad';
+      res.textContent = !navigator.onLine ? 'Нет Интернета.' : e.status === 401 ? 'Ключ не подходит.' : e.status === 404 ? 'Репозиторий не найден или ключ не даёт к нему доступ.' : 'Ошибка: ' + (e.detail || e.message);
+    }
+  };
+  const lo = $('#logout');
+  if (lo) lo.onclick = () => {
+    const warn = queue.length ? `\n\nВНИМАНИЕ: ${queue.length} изменений ещё не отправлены и пропадут.` : '';
+    if (!confirm('Стереть ключ и все главы с этого телефона?' + warn)) return;
+    Object.keys(localStorage).filter(k => k.startsWith('cs.')).forEach(k => localStorage.removeItem(k));
+    location.reload();
+  };
+}
+
+// ---------- запуск ----------
+$('#back').onclick = () => {
+  if (route.screen === 'settings') return go({ screen: route.chapter ? 'chapter' : 'chapters' });
+  if (route.proposal) return go({ proposal: null });
+  if (route.version) return go({ version: null });
+  go({ screen: 'chapters', chapter: null });
+};
+$('#sync').onclick = () => cfg.token ? sync() : go({ screen: 'settings' });
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null }));
+addEventListener('online', () => sync());
+addEventListener('offline', renderStatus);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); });
+setInterval(() => { if (document.visibilityState === 'visible') sync(); }, 5 * 60 * 1000);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+
+render();
+sync();
