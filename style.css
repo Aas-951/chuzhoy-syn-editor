@@ -131,3 +131,5 @@ a { color: var(--accent); }
 .grow { flex: 1; }
 .mt { margin-top: 12px; }
 .scroll { max-height: 50vh; overflow: auto; }
+.editions { display: flex; gap: 8px; margin: 0 0 16px; flex-wrap: wrap; }
+.editions .btn { flex: 1; min-width: 130px; }
