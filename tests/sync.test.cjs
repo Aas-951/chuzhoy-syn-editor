@@ -158,3 +158,21 @@ test('diff modes: split shows old and new separately, new shows only additions',
   const only=h.run('diffHtml('+a+','+b+',"new")');assert.doesNotMatch(only,/<del>/);assert.match(only,/<ins>новое<\/ins>/);
   const mixed=h.run('diffHtml('+a+','+b+',"mixed")');assert.match(mixed,/<del>старое<\/del><ins>новое<\/ins>/);
 });
+
+test('partial acceptance keeps only checked changes and records them', async () => {
+  const h=harness();const base=h.files.get(chapter.file).sha;
+  const oldT='А\n\nБ\n\nВ\n\nГ', newT='А\n\nБ2\n\nВ\n\nГ2';
+  assert.equal(h.run('mergeParts('+JSON.stringify(oldT)+','+JSON.stringify(newT)+',new Set([2])).text'),'А\n\nБ\n\nВ\n\nГ2');
+  assert.equal(h.run('mergeParts('+JSON.stringify(oldT)+','+JSON.stringify(newT)+',new Set()).total'),2);
+  h.put(proposalsPath,JSON.stringify({proposals:[{id:'p1',chapter:'gpt17',base,status:'pending',file:'proposal.md'}]}));
+  h.run('enqueue('+JSON.stringify({type:'decide',chapter:'gpt17',id:'p1',decision:'accepted',base,text:'Частично',parts:[2],total:2})+')');
+  await h.run('pushQueue()');
+  assert.equal(h.files.get(chapter.file).text,'Частично');
+  const p=JSON.parse(h.files.get(proposalsPath).text).proposals[0];
+  assert.equal(p.status,'accepted');assert.deepEqual(p.acceptedParts,[2]);assert.equal(p.partsTotal,2);
+});
+
+test('diff with skip set shows checkboxes and marks skipped part', () => {
+  const h=harness();const html=h.run('diffHtml('+JSON.stringify('А\n\nБ\n\nВ\n\nГ')+','+JSON.stringify('А\n\nБ2\n\nВ\n\nГ2')+',"split",new Set([1]))');
+  assert.match(html,/data-part="1" >/);assert.match(html,/data-part="2" checked/);assert.match(html,/part off/);
+});

@@ -149,3 +149,8 @@ a { color: var(--accent); }
 .diff .now ins { background: rgba(22, 163, 74, .32); border-radius: 3px; }
 .diff .lbl { font-family: system-ui, sans-serif; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); margin: 4px 0; }
 .diff .was p, .diff .now p { margin: 0 0 .5em; }
+.diff .pick { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.diff .pick input { width: 22px; height: 22px; accent-color: var(--ok); margin: 0; }
+.diff .part.off .was, .diff .part.off .now, .diff .part.off > p:not(.ctx) { opacity: .4; }
+.diff .part.off .pick { color: var(--muted); }
+.actbar { position: sticky; bottom: calc(60px + env(safe-area-inset-bottom)); background: var(--bg); padding: 10px 0; margin-top: 12px; border-top: 1px solid var(--line); }

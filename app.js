@@ -119,7 +119,7 @@ const proposalsAll = () => parseJSON(data.files[PROPOSALS]?.text || '', { propos
 function proposalsOf(id) {
   return proposalsAll().filter(p => p.chapter === id).map(p => {
     const op = queue.find(o => o.type === 'decide' && o.id === p.id);
-    return op ? { ...p, status: op.decision, local: true } : p;
+    return op ? { ...p, status: op.decision, local: true, ...(op.parts ? { acceptedParts: op.parts, partsTotal: op.total } : {}) } : p;
   });
 }
 
@@ -197,14 +197,15 @@ async function pushQueue() {
       const cur = await getFile(ch.file);
       if (cur && toLF(cur.text) === toLF(op.text)) { data.files[ch.file] = cur; }
       else if (!cur || cur.sha !== op.base) decision = 'stale';
-      else await putFile(ch.file, withEol(op.text, eolOf(cur.text)), cur.sha, `Принято предложение ${op.id}: ${ch.title}`);
+      else await putFile(ch.file, withEol(op.text, eolOf(cur.text)), cur.sha, `${op.parts ? `Частично (${op.parts.length} из ${op.total}) принято` : 'Принято'} предложение ${op.id}: ${ch.title}`);
     }
     await updateJSON(PROPOSALS, { proposals: [] }, j => {
       const p = (j.proposals || []).find(p => p.id === op.id);
       if (!p) throw new Error('Предложение не найдено. Решение сохранено в очереди.');
       if (p.status !== 'pending' && p.status !== decision) throw new Error('Решение по предложению уже изменилось. Обновите редактор.');
       p.status = decision; p.decidedAt = op.at;
-    }, `Решение по предложению ${op.id}: ${decision}`);
+      if (decision === 'accepted' && op.parts) { p.acceptedParts = op.parts; p.partsTotal = op.total; }
+    }, `Решение по предложению ${op.id}: ${decision}${op.parts && decision === 'accepted' ? ` (правки ${op.parts.join(', ')} из ${op.total})` : ''}`);
     if (decision === 'stale') banner('Глава изменилась после того, как агент подготовил предложение. Предложение не применено — попросите агента обновить его.', true);
     drop(op);
   }
@@ -590,6 +591,22 @@ async function copyAgentTask(ch, agent) {
 
 // --- предложения ---
 const PSTATUS = { pending: 'ждёт решения', accepted: 'принято', rejected: 'отклонено', stale: 'устарело' };
+const proposalStatus = p => p.status === 'accepted' && p.acceptedParts ? `принято частично: ${p.acceptedParts.length} из ${p.partsTotal}` : (PSTATUS[p.status] || p.status);
+// Снятые галочки — пока решение не принято, живут только на экране.
+const skips = {};
+const skipOf = id => skips[id] ||= new Set();
+// Правки нумеруются так же, как в diffHtml: подряд идущие изменённые абзацы — одна правка.
+function mergeParts(oldText, newText, keep) {
+  const ops = lcs(toLF(oldText).split(/\n{2,}/), toLF(newText).split(/\n{2,}/));
+  const out = []; let part = 0;
+  for (let k = 0; k < ops.length; k++) {
+    const [t, x] = ops[k];
+    if (t === '=') { out.push(x); continue; }
+    if (k === 0 || ops[k - 1][0] === '=') part++;
+    if (keep.has(part) ? t === '+' : t === '-') out.push(x);
+  }
+  return { text: out.join('\n\n'), total: part };
+}
 function renderProposals(ch) {
   const v = $('#view');
   const list = proposalsOf(ch.id).sort((a, b) => (b.at || '').localeCompare(a.at || ''));
@@ -599,24 +616,35 @@ function renderProposals(ch) {
     const cur = chapterText(ch);
     if (!p || text == null) { v.innerHTML = '<div class="empty">Текст предложения не загружен — нужен Интернет.</div><div class="row"><button class="btn" id="pback">‹ Назад</button></div>'; $('#pback').onclick = () => go({ proposal: null }); return; }
     const stale = p.base !== data.files[ch.file]?.sha || !!pendingEdit(ch.id);
+    const pending = p.status === 'pending';
+    const skip = skipOf(p.id);
+    const total = mergeParts(cur || '', text, new Set()).total;
+    const keep = new Set(Array.from({ length: total }, (_, i) => i + 1).filter(n => !skip.has(n)));
     v.innerHTML = `<div class="row"><button class="btn" id="pback">‹ Все предложения</button></div>
       <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
       <div class="c">${esc(p.summary || '')}</div>
-      ${stale && p.status === 'pending' ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
-      <p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.</p>
-      <div class="diff">${diffHtml(cur || '', text)}</div>
-      ${p.status === 'pending' ? `<div class="row end mt">
-        <button class="btn danger" id="reject">Отклонить</button>
-        <button class="btn primary" id="accept" ${stale ? 'disabled' : ''}>Принять</button></div>` : `<p class="hint">Статус: ${PSTATUS[p.status] || p.status}</p>`}`;
+      ${stale && pending ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
+      <p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.${pending ? ' Снимите галочку у правки, которую не хотите принимать.' : ''}</p>
+      <div class="diff">${diffHtml(cur || '', text, undefined, pending ? skip : null)}</div>
+      ${pending ? `<div class="row end actbar">
+        <button class="btn danger" id="reject">Отклонить всё</button>
+        <button class="btn primary" id="accept" ${stale || !keep.size ? 'disabled' : ''}>${keep.size === total ? `Принять все (${total})` : `Принять отмеченные (${keep.size} из ${total})`}</button></div>`
+        : `<p class="hint">Статус: ${proposalStatus(p)}</p>`}`;
     $('#pback').onclick = () => go({ proposal: null });
-    if (p.status === 'pending') {
-      $('#reject').onclick = () => { if (confirm('Отклонить предложение?') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' })) go({ proposal: null }, afterDecision('Предложение отклонено.')); };
-      $('#accept').onclick = () => { if (confirm('Принять предложение? Текущий текст останется во вкладке «Версии».') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'accepted', base: p.base, text })) go({ proposal: null, tab: 'read' }, afterDecision('Предложение принято.')); };
+    if (pending) {
+      $('#reject').onclick = () => { if (confirm('Отклонить всё предложение?') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' })) go({ proposal: null }, afterDecision('Предложение отклонено.')); };
+      $('#accept').onclick = () => {
+        const all = keep.size === total;
+        if (!confirm(all ? 'Принять все правки? Текущий текст останется во вкладке «Версии».' : `Принять ${keep.size} из ${total} правок? Остальные не попадут в главу. Текущий текст останется во вкладке «Версии».`)) return;
+        const op = { type: 'decide', chapter: ch.id, id: p.id, decision: 'accepted', base: p.base, text };
+        if (!all) Object.assign(op, { text: mergeParts(cur || '', text, keep).text, parts: [...keep], total });
+        if (enqueue(op)) go({ proposal: null, tab: 'read' }, afterDecision(all ? 'Предложение принято.' : `Принято правок: ${keep.size} из ${total}.`));
+      };
     }
     return;
   }
   v.innerHTML = list.length ? `<div class="list">${list.map(p => `<button class="item" data-p="${esc(p.id)}">
-      <div class="t">${esc(p.by || 'Агент')}<span class="badge ${p.status === 'pending' ? 'pending' : ''}">${PSTATUS[p.status] || p.status}${p.local ? ', не отправлено' : ''}</span></div>
+      <div class="t">${esc(p.by || 'Агент')}<span class="badge ${p.status === 'pending' ? 'pending' : ''}">${proposalStatus(p)}${p.local ? ', не отправлено' : ''}</span></div>
       <div class="s">${fmtDate(p.at)} — ${esc((p.summary || '').slice(0, 160))}</div></button>`).join('')}</div>`
     : '<div class="empty">Предложений нет. Попросите агента в T3: «обработай заметки к этой главе».</div>';
   v.querySelectorAll('[data-p]').forEach(b => b.onclick = () => go({ proposal: b.dataset.p }));
@@ -646,10 +674,11 @@ function wordDiff(a, b) {
   };
 }
 const DIFF_MODES = [['split', 'Было → стало'], ['new', 'Только новое'], ['mixed', 'Вперемешку']];
-function diffHtml(oldText, newText, mode = ui.diffMode || 'split') {
+// skip — Set снятых галочек; если передан, у каждой правки появляется галочка.
+function diffHtml(oldText, newText, mode = ui.diffMode || 'split', skip = null) {
   const pa = toLF(oldText).split(/\n{2,}/), pb = toLF(newText).split(/\n{2,}/);
   const ops = lcs(pa, pb);
-  const html = []; let same = [], places = 0, was = [], now = [];
+  const html = []; let same = [], places = 0, was = [], now = [], inPart = false;
   const clip = s => { s = s.replace(/\s+/g, ' ').trim(); return s.length > 160 ? '…' + s.slice(-160) : s; };
   const flushBlock = () => {
     if (!was.length && !now.length) return;
@@ -661,10 +690,15 @@ function diffHtml(oldText, newText, mode = ui.diffMode || 'split') {
   };
   const flushSame = beforeChange => {
     flushBlock();
+    if (inPart) { html.push('</div>'); inPart = false; }
     const ctx = beforeChange && same.length ? same.at(-1) : null;
     const hidden = same.length - (ctx == null ? 0 : 1);
     if (hidden) html.push(`<div class="gap">… без изменений: ${hidden} абз. …</div>`);
-    if (beforeChange) html.push(`<div class="mark">Правка ${++places}</div>`);
+    if (beforeChange) {
+      const n = ++places, off = skip?.has(n);
+      html.push(`<div class="part${off ? ' off' : ''}">`); inPart = true;
+      html.push(skip ? `<label class="mark pick"><input type="checkbox" data-part="${n}" ${off ? '' : 'checked'}> Правка ${n}${off ? ' — не принимать' : ''}</label>` : `<div class="mark">Правка ${n}</div>`);
+    }
     if (ctx != null) html.push(`<p class="ctx">${esc(clip(ctx))}</p>`);
     same = [];
   };
@@ -795,6 +829,14 @@ $('#back').onclick = () => {
 };
 $('#sync').onclick = () => cfg.token ? sync() : go({ screen: 'settings' });
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null }));
+document.addEventListener('change', e => {
+  const c = e.target.closest?.('[data-part]'); if (!c || !route.proposal) return;
+  const s = skipOf(route.proposal), n = +c.dataset.part, y = c.getBoundingClientRect().top;
+  c.checked ? s.delete(n) : s.add(n);
+  render();
+  const again = document.querySelector(`[data-part="${n}"]`);
+  if (again) window.scrollBy(0, again.getBoundingClientRect().top - y);
+});
 document.addEventListener('click', e => {
   const b = e.target.closest?.('[data-dmode]'); if (!b) return;
   const y = b.getBoundingClientRect().top;
