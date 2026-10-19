@@ -603,7 +603,7 @@ function renderProposals(ch) {
       <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
       <div class="c">${esc(p.summary || '')}</div>
       ${stale && p.status === 'pending' ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
-      <p class="hint"><ins class="diff">зелёное</ins> — добавлено, <del>красное</del> — убрано. Неизменённые абзацы свёрнуты; серым курсивом — конец абзаца перед правкой, чтобы было видно, где она.</p>
+      <p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.</p>
       <div class="diff">${diffHtml(cur || '', text)}</div>
       ${p.status === 'pending' ? `<div class="row end mt">
         <button class="btn danger" id="reject">Отклонить</button>
@@ -635,17 +635,32 @@ function lcs(a, b, eq = (x, y) => x === y) {
   while (i < n) out.push(['-', a[i++]]); while (j < m) out.push(['+', b[j++]]);
   return out;
 }
+// Одна пара абзацев → три вида: вперемешку, только старый, только новый.
 function wordDiff(a, b) {
   const ta = a.split(/(\s+)/), tb = b.split(/(\s+)/);
-  if (ta.length * tb.length > 4e6) return `<del>${esc(a)}</del> <ins>${esc(b)}</ins>`;
-  return lcs(ta, tb).map(([k, x]) => k === '=' ? esc(x) : k === '-' ? `<del>${esc(x)}</del>` : `<ins>${esc(x)}</ins>`).join('');
+  if (ta.length * tb.length > 4e6) return { mixed: `<del>${esc(a)}</del> <ins>${esc(b)}</ins>`, was: `<del>${esc(a)}</del>`, now: `<ins>${esc(b)}</ins>` };
+  const ops = lcs(ta, tb), part = (keep, tag) => ops.map(([k, x]) => k === '=' ? esc(x) : k === keep ? (/^\s+$/.test(x) ? esc(x) : `<${tag}>${esc(x)}</${tag}>`) : '').join('');
+  return {
+    mixed: ops.map(([k, x]) => k === '=' ? esc(x) : k === '-' ? `<del>${esc(x)}</del>` : `<ins>${esc(x)}</ins>`).join(''),
+    was: part('-', 'del'), now: part('+', 'ins'),
+  };
 }
-function diffHtml(oldText, newText) {
+const DIFF_MODES = [['split', 'Было → стало'], ['new', 'Только новое'], ['mixed', 'Вперемешку']];
+function diffHtml(oldText, newText, mode = ui.diffMode || 'split') {
   const pa = toLF(oldText).split(/\n{2,}/), pb = toLF(newText).split(/\n{2,}/);
   const ops = lcs(pa, pb);
-  const html = []; let same = [], places = 0;
+  const html = []; let same = [], places = 0, was = [], now = [];
   const clip = s => { s = s.replace(/\s+/g, ' ').trim(); return s.length > 160 ? '…' + s.slice(-160) : s; };
+  const flushBlock = () => {
+    if (!was.length && !now.length) return;
+    if (mode === 'split') {
+      html.push(`<div class="was"><div class="lbl">Было</div>${was.join('') || '<p class="hint">— (новый текст)</p>'}</div>`);
+      html.push(`<div class="now"><div class="lbl">Стало</div>${now.join('') || '<p class="hint">— (убрано)</p>'}</div>`);
+    } else if (mode === 'new') html.push(now.join('') || '<p class="hint">— (здесь текст убран)</p>');
+    was = []; now = [];
+  };
   const flushSame = beforeChange => {
+    flushBlock();
     const ctx = beforeChange && same.length ? same.at(-1) : null;
     const hidden = same.length - (ctx == null ? 0 : 1);
     if (hidden) html.push(`<div class="gap">… без изменений: ${hidden} абз. …</div>`);
@@ -657,12 +672,17 @@ function diffHtml(oldText, newText) {
     const [t, x] = ops[k];
     if (t === '=') { same.push(x); continue; }
     if (k === 0 || ops[k - 1][0] === '=') flushSame(true);
-    if (t === '-' && ops[k + 1]?.[0] === '+') { html.push(`<p>${wordDiff(x, ops[k + 1][1])}</p>`); k++; }
-    else html.push(t === '-' ? `<p><del>${esc(x)}</del></p>` : `<p><ins>${esc(x)}</ins></p>`);
+    if (t === '-' && ops[k + 1]?.[0] === '+') {
+      const d = wordDiff(x, ops[k + 1][1]); k++;
+      if (mode === 'mixed') html.push(`<p>${d.mixed}</p>`); else { was.push(`<p>${d.was}</p>`); now.push(`<p>${d.now}</p>`); }
+    } else if (mode === 'mixed') html.push(t === '-' ? `<p><del>${esc(x)}</del></p>` : `<p><ins>${esc(x)}</ins></p>`);
+    else if (t === '-') was.push(`<p><del>${esc(x)}</del></p>`);
+    else now.push(`<p><ins>${esc(x)}</ins></p>`);
   }
   flushSame(false);
   if (!places) return '<div class="empty">Текст не отличается.</div>';
-  return `<p class="hint">Мест с правками: ${places}.</p>` + html.join('');
+  const modes = `<div class="filters dmodes">${DIFF_MODES.map(([k, l]) => `<button data-dmode="${k}" class="${k === mode ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+  return `${modes}<p class="hint">Мест с правками: ${places}.</p><div class="diff ${mode}">${html.join('')}</div>`;
 }
 
 // --- версии ---
@@ -702,6 +722,7 @@ async function openConflict(path) {
   const ch = chapterById(c.chapter);
   const mine = data.files[path] ? toLF(data.files[path].text) : null;
   const d = $('#sheet');
+  d.dataset.conflict = path;
   d.innerHTML = `<h3>Конфликт: ${esc(ch?.title || c.chapter)}</h3>
     <p class="hint">Пока вы правили без сети, глава изменилась в GitHub. Ваша версия сохранена в файле ${esc(path)}. Ниже — чем ваша версия отличается от текущей.</p>
     <div class="diff scroll">${mine != null && ch ? diffHtml(serverChapter(ch) || '', mine) : 'Файл ещё не загружен.'}</div>
@@ -774,6 +795,15 @@ $('#back').onclick = () => {
 };
 $('#sync').onclick = () => cfg.token ? sync() : go({ screen: 'settings' });
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null }));
+document.addEventListener('click', e => {
+  const b = e.target.closest?.('[data-dmode]'); if (!b) return;
+  const y = b.getBoundingClientRect().top;
+  ui.diffMode = b.dataset.dmode; save(KEY.ui, ui);
+  if (b.closest('dialog')) { const p = b.closest('dialog').dataset.conflict; b.closest('dialog').close(); return openConflict(p); }
+  render();
+  const again = document.querySelector(`[data-dmode="${b.dataset.dmode}"]`);
+  if (again) window.scrollBy(0, again.getBoundingClientRect().top - y);
+});
 addEventListener('online', () => sync());
 addEventListener('offline', renderStatus);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); });

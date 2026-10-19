@@ -141,3 +141,11 @@ a { color: var(--accent); }
 .diff .ctx { color: var(--muted); font-style: italic; }
 .diff .mark { font-family: system-ui, sans-serif; font-size: 12px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: .03em; margin: 1.4em 0 .3em; }
 .btn.primary .count:not(:empty) { background: var(--accent-fg); color: var(--accent); }
+.dmodes { font-family: system-ui, sans-serif; flex-wrap: wrap; }
+.diff .was, .diff .now { border-left: 4px solid; border-radius: 4px; padding: 2px 0 2px 12px; margin: 4px 0; }
+.diff .was { border-color: var(--bad); background: var(--del); }
+.diff .now { border-color: var(--ok); background: var(--ins); }
+.diff .was del { text-decoration: none; background: rgba(220, 38, 38, .28); border-radius: 3px; }
+.diff .now ins { background: rgba(22, 163, 74, .32); border-radius: 3px; }
+.diff .lbl { font-family: system-ui, sans-serif; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); margin: 4px 0; }
+.diff .was p, .diff .now p { margin: 0 0 .5em; }

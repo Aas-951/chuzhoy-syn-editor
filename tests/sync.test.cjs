@@ -151,3 +151,10 @@ test('diff marks each changed place and shows preceding context', () => {
   const h=harness();const html=h.run('diffHtml(' + JSON.stringify('А\n\nБ\n\nВ\n\nГ') + ',' + JSON.stringify('А\n\nБ2\n\nВ\n\nГ2') + ')');
   assert.match(html,/Мест с правками: 2/);assert.match(html,/Правка 2/);assert.match(html,/class="ctx">А</);
 });
+
+test('diff modes: split shows old and new separately, new shows only additions', () => {
+  const h=harness();const a=JSON.stringify('А\n\nстарое слово'),b=JSON.stringify('А\n\nновое слово');
+  const split=h.run('diffHtml('+a+','+b+',"split")');assert.match(split,/class="was"[\s\S]*<del>старое<\/del>[\s\S]*class="now"[\s\S]*<ins>новое<\/ins>/);
+  const only=h.run('diffHtml('+a+','+b+',"new")');assert.doesNotMatch(only,/<del>/);assert.match(only,/<ins>новое<\/ins>/);
+  const mixed=h.run('diffHtml('+a+','+b+',"mixed")');assert.match(mixed,/<del>старое<\/del><ins>новое<\/ins>/);
+});
