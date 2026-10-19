@@ -173,6 +173,19 @@ test('partial acceptance keeps only checked changes and records them', async () 
 });
 
 test('diff with skip set shows checkboxes and marks skipped part', () => {
-  const h=harness();const html=h.run('diffHtml('+JSON.stringify('А\n\nБ\n\nВ\n\nГ')+','+JSON.stringify('А\n\nБ2\n\nВ\n\nГ2')+',"split",new Set([1]))');
+  const h=harness();const html=h.run('diffHtml('+JSON.stringify('А\n\nБ\n\nВ\n\nГ')+','+JSON.stringify('А\n\nБ2\n\nВ\n\nГ2')+',"split",{skip:new Set([1])})');
   assert.match(html,/data-part="1" >/);assert.match(html,/data-part="2" checked/);assert.match(html,/part off/);
+});
+
+test('author edit of a change replaces that change on acceptance; empty edit removes it', () => {
+  const h=harness();const o=JSON.stringify('А\n\nБ\n\nВ\n\nГ'),n=JSON.stringify('А\n\nБ2\n\nВ\n\nГ2');
+  assert.equal(h.run('mergeParts('+o+','+n+',new Set([1,2]),{1:"Б мой"}).text'),'А\n\nБ мой\n\nВ\n\nГ2');
+  assert.equal(h.run('mergeParts('+o+','+n+',new Set([1,2]),{2:"  "}).text'),'А\n\nБ2\n\nВ');
+  assert.equal(h.run('mergeParts('+o+','+n+',new Set([2]),{1:"не важно"}).text'),'А\n\nБ\n\nВ\n\nГ2');
+  assert.deepEqual(h.run('JSON.stringify(diffParts('+o+','+n+'))'),JSON.stringify([{was:['Б'],now:['Б2']},{was:['Г'],now:['Г2']}]));
+});
+
+test('diff shows author variant and part remarks', () => {
+  const h=harness();const html=h.run('diffHtml('+JSON.stringify('А\n\nБ')+','+JSON.stringify('А\n\nБ2')+',"split",{skip:new Set(),edits:{1:"Мой вариант"},notes:{1:[{comment:"Слишком в лоб"}]}})');
+  assert.match(html,/Стало — ваш вариант[\s\S]*Мой вариант/);assert.match(html,/Ваше замечание[\s\S]*Слишком в лоб/);assert.match(html,/data-open="1"/);
 });

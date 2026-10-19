@@ -119,7 +119,7 @@ const proposalsAll = () => parseJSON(data.files[PROPOSALS]?.text || '', { propos
 function proposalsOf(id) {
   return proposalsAll().filter(p => p.chapter === id).map(p => {
     const op = queue.find(o => o.type === 'decide' && o.id === p.id);
-    return op ? { ...p, status: op.decision, local: true, ...(op.parts ? { acceptedParts: op.parts, partsTotal: op.total } : {}) } : p;
+    return op ? { ...p, status: op.decision, local: true, ...(op.parts ? { acceptedParts: op.parts, partsTotal: op.total, editedParts: op.edited } : {}) } : p;
   });
 }
 
@@ -205,6 +205,7 @@ async function pushQueue() {
       if (p.status !== 'pending' && p.status !== decision) throw new Error('Решение по предложению уже изменилось. Обновите редактор.');
       p.status = decision; p.decidedAt = op.at;
       if (decision === 'accepted' && op.parts) { p.acceptedParts = op.parts; p.partsTotal = op.total; }
+      if (decision === 'accepted' && op.edited) p.editedParts = op.edited;
     }, `Решение по предложению ${op.id}: ${decision}${op.parts && decision === 'accepted' ? ` (правки ${op.parts.join(', ')} из ${op.total})` : ''}`);
     if (decision === 'stale') banner('Глава изменилась после того, как агент подготовил предложение. Предложение не применено — попросите агента обновить его.', true);
     drop(op);
@@ -548,6 +549,7 @@ function renderNotes(ch) {
     ${shown.map(n => `<div class="note ${n.status !== 'open' ? 'done' : ''}">
       <div class="row"><span class="type ${n.type}">${WHO[n.type] || n.type}</span><span class="meta">${fmtDate(n.createdAt)} · ${STATUS[n.status] || n.status}${pendingIds.has(n.id) ? ' · не отправлено' : ''}</span></div>
       ${n.legacy?.differentText ? '<p class="hint">Заметка перенесена с прежнего текста. Проверьте её актуальность.</p>' : ''}
+      ${n.proposal ? `<p class="hint">К предложению ${esc(n.proposal)}, правка ${esc(String(n.part))}</p>` : ''}
       ${n.quote ? `<div class="q" data-goto="${esc(n.id)}">${esc(n.quote)}</div>` : ''}
       <div class="c">${esc(n.comment)}</div>
       ${(n.replies || []).map(r => `<div class="reply"><div class="who">${esc(r.by)} · <span class="meta">${fmtDate(r.at)}</span></div>${esc(r.text)}</div>`).join('')}
@@ -591,21 +593,81 @@ async function copyAgentTask(ch, agent) {
 
 // --- предложения ---
 const PSTATUS = { pending: 'ждёт решения', accepted: 'принято', rejected: 'отклонено', stale: 'устарело' };
-const proposalStatus = p => p.status === 'accepted' && p.acceptedParts ? `принято частично: ${p.acceptedParts.length} из ${p.partsTotal}` : (PSTATUS[p.status] || p.status);
+function proposalStatus(p) {
+  if (p.status !== 'accepted' || !p.acceptedParts) return PSTATUS[p.status] || p.status;
+  const base = p.acceptedParts.length === p.partsTotal ? 'принято' : `принято частично: ${p.acceptedParts.length} из ${p.partsTotal}`;
+  return base + (p.editedParts?.length ? `, с вашими исправлениями: ${p.editedParts.length}` : '');
+}
 // Снятые галочки — пока решение не принято, живут только на экране.
 const skips = {};
 const skipOf = id => skips[id] ||= new Set();
+// Свой вариант текста правки — хранится на телефоне до решения по предложению.
+const PEDIT = 'cs.pedit';
+let pedits = load(PEDIT, {});
+const editsOf = id => pedits[id] ||= {};
+const dropEdits = id => { delete pedits[id]; save(PEDIT, pedits); };
 // Правки нумеруются так же, как в diffHtml: подряд идущие изменённые абзацы — одна правка.
-function mergeParts(oldText, newText, keep) {
+function diffParts(oldText, newText) {
   const ops = lcs(toLF(oldText).split(/\n{2,}/), toLF(newText).split(/\n{2,}/));
-  const out = []; let part = 0;
+  const parts = [];
+  for (let k = 0; k < ops.length; k++) {
+    const [t, x] = ops[k];
+    if (t === '=') continue;
+    if (k === 0 || ops[k - 1][0] === '=') parts.push({ was: [], now: [] });
+    (t === '-' ? parts.at(-1).was : parts.at(-1).now).push(x);
+  }
+  return parts;
+}
+function mergeParts(oldText, newText, keep, edits = {}) {
+  const ops = lcs(toLF(oldText).split(/\n{2,}/), toLF(newText).split(/\n{2,}/));
+  const out = [], done = new Set(); let part = 0;
   for (let k = 0; k < ops.length; k++) {
     const [t, x] = ops[k];
     if (t === '=') { out.push(x); continue; }
     if (k === 0 || ops[k - 1][0] === '=') part++;
+    if (keep.has(part) && edits[part] != null) {
+      if (!done.has(part)) { done.add(part); if (edits[part].trim()) out.push(toLF(edits[part]).trim()); }
+      continue;
+    }
     if (keep.has(part) ? t === '+' : t === '-') out.push(x);
   }
   return { text: out.join('\n\n'), total: part };
+}
+const partNotes = (ch, p) => notesOf(ch.id).filter(n => n.proposal === p.id);
+function openPartSheet(n) {
+  const ch = chapterById(route.chapter);
+  const p = ch && proposalsOf(ch.id).find(p => p.id === route.proposal);
+  if (!p || p.status !== 'pending' || !data.files[p.file]) return;
+  const part = diffParts(chapterText(ch) || '', toLF(data.files[p.file].text))[n - 1]; if (!part) return;
+  const edits = editsOf(p.id), original = part.now.join('\n\n');
+  const d = $('#sheet');
+  delete d.dataset.conflict;
+  d.innerHTML = `<h3>Правка ${n}</h3>
+    ${part.was.length ? `<p class="hint">Было:</p><div class="q">${esc(part.was.join('\n\n'))}</div>` : ''}
+    <p class="hint">Стало — можно исправить прямо здесь${part.now.length ? '' : ' (агент этот текст убрал)'}:</p>
+    <textarea id="partText" class="tall"></textarea>
+    ${edits[n] != null ? '<div class="row"><button class="btn" id="partReset">Вернуть вариант агента</button></div>' : ''}
+    <p class="hint">Ваше замечание к этой правке. Агент увидит его, когда вы напишете в чате «посмотри замечания».</p>
+    <textarea id="partNote" placeholder="Например: слишком в лоб; оставь, как было, но убери последнюю фразу…"></textarea>
+    <div class="row end"><button class="btn" id="cancel">Отмена</button><button class="btn primary" id="ok">Сохранить</button></div>`;
+  $('#partText').value = edits[n] ?? original;
+  d.showModal();
+  $('#cancel').onclick = () => d.close();
+  if ($('#partReset')) $('#partReset').onclick = () => { $('#partText').value = original; };
+  $('#ok').onclick = () => {
+    const value = toLF($('#partText').value);
+    if (value.trim() !== original.trim()) { edits[n] = value; skipOf(p.id).delete(n); } else delete edits[n];
+    save(PEDIT, pedits);
+    const comment = $('#partNote').value.trim();
+    if (comment) {
+      const quote = (edits[n] ?? original ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
+      if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
+        id: uid('n'), type: 'remark', status: 'open', quote, prefix: '', comment, author: 'автор',
+        createdAt: new Date().toISOString(), chapterSha: data.files[ch.file]?.sha || null, replies: [], proposal: p.id, part: n,
+      } })) return;
+    }
+    d.close(); render();
+  };
 }
 function renderProposals(ch) {
   const v = $('#view');
@@ -617,28 +679,32 @@ function renderProposals(ch) {
     if (!p || text == null) { v.innerHTML = '<div class="empty">Текст предложения не загружен — нужен Интернет.</div><div class="row"><button class="btn" id="pback">‹ Назад</button></div>'; $('#pback').onclick = () => go({ proposal: null }); return; }
     const stale = p.base !== data.files[ch.file]?.sha || !!pendingEdit(ch.id);
     const pending = p.status === 'pending';
-    const skip = skipOf(p.id);
+    const skip = skipOf(p.id), edits = editsOf(p.id);
     const total = mergeParts(cur || '', text, new Set()).total;
     const keep = new Set(Array.from({ length: total }, (_, i) => i + 1).filter(n => !skip.has(n)));
+    const edited = Object.keys(edits).map(Number).filter(n => keep.has(n));
+    const notesByPart = {};
+    for (const n of partNotes(ch, p)) (notesByPart[n.part] ||= []).push(n);
     v.innerHTML = `<div class="row"><button class="btn" id="pback">‹ Все предложения</button></div>
       <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
       <div class="c">${esc(p.summary || '')}</div>
       ${stale && pending ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
-      <p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.${pending ? ' Снимите галочку у правки, которую не хотите принимать.' : ''}</p>
-      <div class="diff">${diffHtml(cur || '', text, undefined, pending ? skip : null)}</div>
+      <p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.${pending ? ' Снимите галочку у правки, которую не хотите принимать. Нажмите на саму правку, чтобы исправить её или оставить замечание.' : ''}</p>
+      <div class="diff">${diffHtml(cur || '', text, undefined, pending ? { skip, edits, notes: notesByPart } : null)}</div>
       ${pending ? `<div class="row end actbar">
         <button class="btn danger" id="reject">Отклонить всё</button>
         <button class="btn primary" id="accept" ${stale || !keep.size ? 'disabled' : ''}>${keep.size === total ? `Принять все (${total})` : `Принять отмеченные (${keep.size} из ${total})`}</button></div>`
         : `<p class="hint">Статус: ${proposalStatus(p)}</p>`}`;
     $('#pback').onclick = () => go({ proposal: null });
     if (pending) {
-      $('#reject').onclick = () => { if (confirm('Отклонить всё предложение?') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' })) go({ proposal: null }, afterDecision('Предложение отклонено.')); };
+      $('#reject').onclick = () => { if (confirm('Отклонить всё предложение?') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' })) { dropEdits(p.id); go({ proposal: null }, afterDecision('Предложение отклонено.')); } };
       $('#accept').onclick = () => {
-        const all = keep.size === total;
-        if (!confirm(all ? 'Принять все правки? Текущий текст останется во вкладке «Версии».' : `Принять ${keep.size} из ${total} правок? Остальные не попадут в главу. Текущий текст останется во вкладке «Версии».`)) return;
+        const all = keep.size === total && !edited.length;
+        const yours = edited.length ? ` Из них с вашими исправлениями: ${edited.length}.` : '';
+        if (!confirm(keep.size === total ? `Принять все правки?${yours} Текущий текст останется во вкладке «Версии».` : `Принять ${keep.size} из ${total} правок?${yours} Остальные не попадут в главу. Текущий текст останется во вкладке «Версии».`)) return;
         const op = { type: 'decide', chapter: ch.id, id: p.id, decision: 'accepted', base: p.base, text };
-        if (!all) Object.assign(op, { text: mergeParts(cur || '', text, keep).text, parts: [...keep], total });
-        if (enqueue(op)) go({ proposal: null, tab: 'read' }, afterDecision(all ? 'Предложение принято.' : `Принято правок: ${keep.size} из ${total}.`));
+        if (!all) Object.assign(op, { text: mergeParts(cur || '', text, keep, edits).text, parts: [...keep], total, ...(edited.length ? { edited } : {}) });
+        if (enqueue(op)) { dropEdits(p.id); go({ proposal: null, tab: 'read' }, afterDecision(keep.size === total ? 'Предложение принято.' : `Принято правок: ${keep.size} из ${total}.`)); }
       };
     }
     return;
@@ -674,18 +740,28 @@ function wordDiff(a, b) {
   };
 }
 const DIFF_MODES = [['split', 'Было → стало'], ['new', 'Только новое'], ['mixed', 'Вперемешку']];
-// skip — Set снятых галочек; если передан, у каждой правки появляется галочка.
-function diffHtml(oldText, newText, mode = ui.diffMode || 'split', skip = null) {
+// pick — { skip, edits, notes } для предложения, ждущего решения: галочки, свой вариант, замечания.
+function diffHtml(oldText, newText, mode = ui.diffMode || 'split', pick = null) {
   const pa = toLF(oldText).split(/\n{2,}/), pb = toLF(newText).split(/\n{2,}/);
   const ops = lcs(pa, pb);
   const html = []; let same = [], places = 0, was = [], now = [], inPart = false;
   const clip = s => { s = s.replace(/\s+/g, ' ').trim(); return s.length > 160 ? '…' + s.slice(-160) : s; };
+  const paras = s => toLF(s).split(/\n{2,}/).map(x => x.trim()).filter(Boolean).map(x => `<p>${esc(x)}</p>`).join('') || '<p class="hint">— (вы убрали этот текст)</p>';
   const flushBlock = () => {
-    if (!was.length && !now.length) return;
-    if (mode === 'split') {
-      html.push(`<div class="was"><div class="lbl">Было</div>${was.join('') || '<p class="hint">— (новый текст)</p>'}</div>`);
-      html.push(`<div class="now"><div class="lbl">Стало</div>${now.join('') || '<p class="hint">— (убрано)</p>'}</div>`);
-    } else if (mode === 'new') html.push(now.join('') || '<p class="hint">— (здесь текст убран)</p>');
+    if (!inPart) return;
+    const mine = pick?.edits?.[places];
+    if (was.length || now.length || mine != null) {
+      if (mine != null) {
+        if (mode === 'split') html.push(`<div class="was"><div class="lbl">Было</div>${was.join('') || '<p class="hint">— (новый текст)</p>'}</div>`);
+        if (mode === 'mixed') html.push(now.join(''));
+        html.push(`<div class="now mine"><div class="lbl">Стало — ваш вариант</div>${paras(mine)}</div>`);
+      } else if (mode === 'split') {
+        html.push(`<div class="was"><div class="lbl">Было</div>${was.join('') || '<p class="hint">— (новый текст)</p>'}</div>`);
+        html.push(`<div class="now"><div class="lbl">Стало</div>${now.join('') || '<p class="hint">— (убрано)</p>'}</div>`);
+      } else if (mode === 'new') html.push(now.join('') || '<p class="hint">— (здесь текст убран)</p>');
+      else html.push(now.join(''));
+    }
+    for (const n of pick?.notes?.[places] || []) html.push(`<div class="pnote"><span class="lbl">Ваше замечание${n.replies?.length ? ` · ответов: ${n.replies.length}` : ''}</span>${esc(n.comment)}</div>`);
     was = []; now = [];
   };
   const flushSame = beforeChange => {
@@ -695,9 +771,9 @@ function diffHtml(oldText, newText, mode = ui.diffMode || 'split', skip = null) 
     const hidden = same.length - (ctx == null ? 0 : 1);
     if (hidden) html.push(`<div class="gap">… без изменений: ${hidden} абз. …</div>`);
     if (beforeChange) {
-      const n = ++places, off = skip?.has(n);
-      html.push(`<div class="part${off ? ' off' : ''}">`); inPart = true;
-      html.push(skip ? `<label class="mark pick"><input type="checkbox" data-part="${n}" ${off ? '' : 'checked'}> Правка ${n}${off ? ' — не принимать' : ''}</label>` : `<div class="mark">Правка ${n}</div>`);
+      const n = ++places, off = pick?.skip?.has(n);
+      html.push(`<div class="part${off ? ' off' : ''}"${pick ? ` data-open="${n}"` : ''}>`); inPart = true;
+      html.push(pick ? `<div class="row"><label class="mark pick"><input type="checkbox" data-part="${n}" ${off ? '' : 'checked'}> Правка ${n}${off ? ' — не принимать' : ''}</label><span class="grow"></span><span class="tap">✎ исправить · замечание</span></div>` : `<div class="mark">Правка ${n}</div>`);
     }
     if (ctx != null) html.push(`<p class="ctx">${esc(clip(ctx))}</p>`);
     same = [];
@@ -706,10 +782,11 @@ function diffHtml(oldText, newText, mode = ui.diffMode || 'split', skip = null) 
     const [t, x] = ops[k];
     if (t === '=') { same.push(x); continue; }
     if (k === 0 || ops[k - 1][0] === '=') flushSame(true);
+    // В режиме «вперемешку» смешанный абзац копится в now, чтобы выводиться внутри своей правки.
     if (t === '-' && ops[k + 1]?.[0] === '+') {
       const d = wordDiff(x, ops[k + 1][1]); k++;
-      if (mode === 'mixed') html.push(`<p>${d.mixed}</p>`); else { was.push(`<p>${d.was}</p>`); now.push(`<p>${d.now}</p>`); }
-    } else if (mode === 'mixed') html.push(t === '-' ? `<p><del>${esc(x)}</del></p>` : `<p><ins>${esc(x)}</ins></p>`);
+      if (mode === 'mixed') now.push(`<p>${d.mixed}</p>`); else { was.push(`<p>${d.was}</p>`); now.push(`<p>${d.now}</p>`); }
+    } else if (mode === 'mixed') now.push(t === '-' ? `<p><del>${esc(x)}</del></p>` : `<p><ins>${esc(x)}</ins></p>`);
     else if (t === '-') was.push(`<p><del>${esc(x)}</del></p>`);
     else now.push(`<p><ins>${esc(x)}</ins></p>`);
   }
@@ -838,6 +915,8 @@ document.addEventListener('change', e => {
   if (again) window.scrollBy(0, again.getBoundingClientRect().top - y);
 });
 document.addEventListener('click', e => {
+  const part = e.target.closest?.('[data-open]');
+  if (part && !e.target.closest('.pick') && route.proposal) return openPartSheet(+part.dataset.open);
   const b = e.target.closest?.('[data-dmode]'); if (!b) return;
   const y = b.getBoundingClientRect().top;
   ui.diffMode = b.dataset.dmode; save(KEY.ui, ui);
