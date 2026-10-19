@@ -510,11 +510,18 @@ function renderEdit(ch) {
   const draft = typeof rawDraft === 'string' ? { text: rawDraft, base: data.files[ch.file]?.sha } : rawDraft;
   const editBase = draft?.base ?? pendingEdit(ch.id)?.base ?? data.files[ch.file]?.sha;
   const text = draft?.text ?? base;
-  v.innerHTML = `${draft != null && draft.text !== base ? '<p class="hint">Восстановлен несохранённый черновик с этого телефона.</p>' : ''}
+  // По умолчанию — по абзацам; весь текст целиком — по кнопке или если есть несохранённый черновик.
+  if (!route.rawEdit && (draft == null || draft.text === base)) return renderParagraphs(ch, base);
+  v.innerHTML = `<div class="row"><button class="btn" id="byPara">‹ По абзацам</button></div>
+    ${draft != null && draft.text !== base ? '<p class="hint">Восстановлен несохранённый черновик с этого телефона.</p>' : ''}
     <textarea class="editor" id="ed" spellcheck="true"></textarea>
     <p class="hint" id="wc"></p>
     <div class="row end"><button class="btn danger" id="discard">Отменить правки</button><button class="btn primary" id="saveEd">Сохранить</button></div>
     <p class="hint">«Сохранить» записывает правку на телефоне и отправляет её в GitHub, как только будет Интернет. Старая версия остаётся во вкладке «Версии».</p>`;
+  $('#byPara').onclick = () => {
+    if ($('#ed').value !== base && !confirm('Выйти из правки всего текста? Несохранённые изменения пропадут.')) return;
+    localStorage.removeItem(KEY.draft(ch.id)); go({ rawEdit: false });
+  };
   const ed = $('#ed'); ed.value = text;
   const wc = () => $('#wc').textContent = `${words(ed.value).toLocaleString('ru-RU')} слов`;
   wc();
@@ -526,7 +533,68 @@ function renderEdit(ch) {
     const prev = pendingEdit(ch.id);
     if (!enqueue({ type: 'edit', chapter: ch.id, base: prev ? prev.base : editBase, text: value })) return;
     localStorage.removeItem(KEY.draft(ch.id));
-    go({ tab: 'read' });
+    go({ tab: 'read', rawEdit: false });
+  };
+}
+
+// Глава по абзацам: нажатие на абзац — замечание к нему или правка только этого абзаца.
+const splitParas = text => toLF(text).split(/(\n{2,})/);   // чётные — абзацы, нечётные — разделители
+function renderParagraphs(ch, text) {
+  const v = $('#view');
+  const parts = splitParas(text);
+  const notes = openNotes(ch.id);
+  const html = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const p = parts[i]; if (!p.trim()) continue;
+    // Заголовки и «* * *» не трогаем: правка и замечания — только к абзацам текста.
+    if (/^\s*(#{1,3}\s|\*\s*\*\s*\*\s*$|-{3,}\s*$)/.test(p)) { html.push(mdToHtml(p)); continue; }
+    const flat = norm(p);
+    const mine = notes.filter(n => n.quote && flat.includes(norm(n.quote)));
+    html.push(`<div class="para${mine.length ? ' noted' : ''}" data-para="${i}">${mdToHtml(p)}${mine.map(n =>
+      `<div class="pnote"><span class="lbl">${WHO[n.type] || 'Заметка'}${n.replies?.length ? ` · ответов: ${n.replies.length}` : ''}</span>${esc(n.comment)}</div>`).join('')}</div>`);
+  }
+  v.innerHTML = `<p class="hint">Нажмите на абзац, чтобы оставить к нему замечание или поправить его.</p>
+    ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
+    <div class="row end"><button class="btn" id="rawEdit">Править весь текст</button></div>
+    <article class="article paras">${html.join('')}</article>`;
+  $('#rawEdit').onclick = () => go({ rawEdit: true });
+  v.querySelectorAll('[data-para]').forEach(el => el.onclick = () => { if (!getSelection().isCollapsed) return; paraSheet(ch, +el.dataset.para); });
+}
+function paraSheet(ch, i) {
+  const base = chapterText(ch); if (base == null) return;
+  const parts = splitParas(base), original = parts[i]; if (original == null) return;
+  const d = $('#sheet');
+  delete d.dataset.conflict;
+  d.innerHTML = `<h3>Абзац</h3>
+    <textarea id="paraText" class="tall"></textarea>
+    <p class="hint">Можно поправить текст абзаца прямо здесь — изменится только он.</p>
+    <div class="seg">
+      <label><input type="radio" name="type" value="remark" checked>Замечание</label>
+      <label><input type="radio" name="type" value="question">Вопрос агенту</label>
+    </div>
+    <textarea id="paraNote" autofocus placeholder="Ваше замечание к этому абзацу… Агент увидит его, когда вы напишете «посмотри замечания»."></textarea>
+    <div class="row end"><button class="btn" id="cancel">Отмена</button><button class="btn primary" id="ok">Сохранить</button></div>`;
+  $('#paraText').value = original;
+  d.showModal();
+  $('#paraNote').focus();
+  $('#cancel').onclick = () => d.close();
+  $('#ok').onclick = () => {
+    const value = toLF($('#paraText').value).trim(), comment = $('#paraNote').value.trim();
+    const changed = value !== original.trim();
+    if (!changed && !comment) return d.close();
+    if (changed) {
+      parts[i] = value + (original.match(/\s*$/)[0]);
+      const prev = pendingEdit(ch.id);
+      if (!enqueue({ type: 'edit', chapter: ch.id, base: prev ? prev.base : data.files[ch.file]?.sha, text: parts.join('') })) return;
+    }
+    if (comment) {
+      const quote = (value || original).replace(/\s+/g, ' ').trim().slice(0, 300);
+      if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
+        id: uid('n'), type: d.querySelector('input[name=type]:checked').value, status: 'open', quote, prefix: '', comment,
+        author: 'автор', createdAt: new Date().toISOString(), chapterSha: pendingEdit(ch.id) ? null : data.files[ch.file]?.sha || null, replies: [],
+      } })) return;
+    }
+    d.close(); render();
   };
 }
 
@@ -909,7 +977,7 @@ $('#back').onclick = () => {
   go({ screen: 'chapters', chapter: null });
 };
 $('#sync').onclick = () => cfg.token ? sync() : go({ screen: 'settings' });
-document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null }));
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null, rawEdit: false }));
 document.addEventListener('change', e => {
   const c = e.target.closest?.('[data-part]'); if (!c || !route.proposal) return;
   const s = skipOf(route.proposal), n = +c.dataset.part, y = c.getBoundingClientRect().top;

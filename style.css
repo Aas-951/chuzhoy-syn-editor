@@ -160,3 +160,9 @@ a { color: var(--accent); }
 .diff .pnote { font-family: system-ui, sans-serif; font-size: 14px; margin: 6px 0; padding: 8px 10px; border-radius: 8px; background: var(--card); border: 1px dashed var(--warn); white-space: pre-wrap; }
 .diff .pnote .lbl { display: block; color: var(--warn); }
 .sheet textarea.tall { min-height: 180px; font-family: Georgia, serif; font-size: 16px; line-height: 1.5; }
+.paras .para { border-radius: 10px; padding: 6px 8px; margin: 0 -8px 4px; cursor: pointer; }
+.paras .para:active { background: var(--card); }
+.paras .para.noted { background: rgba(250, 204, 21, .12); }
+.paras .para p { margin-bottom: .2em; }
+.pnote { font-family: system-ui, sans-serif; font-size: 14px; margin: 6px 0; padding: 8px 10px; border-radius: 8px; background: var(--card); border: 1px dashed var(--warn); white-space: pre-wrap; text-indent: 0; }
+.pnote .lbl { display: block; color: var(--warn); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }

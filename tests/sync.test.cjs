@@ -199,3 +199,14 @@ test('part with an open remark starts unchecked unless the author wrote own vari
   const html=h.elements.get('#view').innerHTML;
   assert.match(html,/data-part="2" >/);assert.match(html,/data-part="1" checked/);assert.match(html,/есть замечание/);assert.match(html,/Принять отмеченные \(1 из 2\)/);
 });
+
+test('paragraph view lists paragraphs and attaches notes; raw editor on request', () => {
+  const h=harness();h.put(chapter.file,'## Глава\n\nПервый абзац.\n\nВторой абзац тут.\n');
+  h.put(notesPath,JSON.stringify({notes:[{id:'n1',type:'remark',status:'open',quote:'Второй абзац',comment:'Сократить',replies:[]}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';route={screen:"chapter",chapter:"gpt17",tab:"edit"};renderEdit(chapterById("gpt17"))');
+  let html=h.elements.get('#view').innerHTML;
+  assert.match(html,/data-para="4"/);assert.match(html,/para noted[^>]*data-para="4"[\s\S]*Сократить/);assert.doesNotMatch(html,/textarea class="editor"/);
+  h.run('route.rawEdit=true;renderEdit(chapterById("gpt17"))');html=h.elements.get('#view').innerHTML;
+  assert.match(html,/textarea class="editor"/);
+  assert.equal(h.run('JSON.stringify(splitParas('+JSON.stringify('а\n\nб\n')+'))'),JSON.stringify(['а','\n\n','б\n']));
+});
