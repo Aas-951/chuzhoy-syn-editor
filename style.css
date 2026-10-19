@@ -133,3 +133,11 @@ a { color: var(--accent); }
 .scroll { max-height: 50vh; overflow: auto; }
 .editions { display: flex; gap: 8px; margin: 0 0 16px; flex-wrap: wrap; }
 .editions .btn { flex: 1; min-width: 130px; }
+.inbox { margin: 0 0 18px; }
+.inbox h2 { font-size: 15px; margin: 0 0 8px; color: var(--accent); }
+.item.todo { border-color: var(--accent); border-left-width: 4px; }
+.item .where { font-size: 13px; margin-top: 2px; }
+.badge.todo { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.diff .ctx { color: var(--muted); font-style: italic; }
+.diff .mark { font-family: system-ui, sans-serif; font-size: 12px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: .03em; margin: 1.4em 0 .3em; }
+.btn.primary .count:not(:empty) { background: var(--accent-fg); color: var(--accent); }

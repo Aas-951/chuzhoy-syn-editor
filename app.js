@@ -295,18 +295,22 @@ function renderStatus() {
   dot.className = 'dot on'; t.textContent = n ? `Ждут: ${n}` : 'Всё отправлено';
 }
 
-function go(r) { route = { ...route, ...r }; window.scrollTo(0, 0); render(); }
+let notice = '';
+function go(r, msg = '') { notice = msg; route = { ...route, ...r }; window.scrollTo(0, 0); render(); }
 
 function render() {
   renderStatus();
   const msgs = [];
   if (syncError) msgs.push(esc(syncError));
-  for (const c of data.conflicts || []) {
+  const conflicts = data.conflicts || [];
+  for (const c of conflicts) {
     const ch = chapterById(c.chapter);
     msgs.push(`Конфликт в «${esc(ch?.title || c.chapter)}»: глава изменилась, пока вы правили без сети. Ваша версия сохранена отдельно. <button data-conflict="${esc(c.path)}">Открыть</button>`);
   }
-  banner(msgs.join('<br>'), !!syncError || msgs.length > 0);
+  if (notice) msgs.push(notice);
+  banner(msgs.join('<br>'), !!syncError || conflicts.length > 0);
   document.querySelectorAll('[data-conflict]').forEach(b => b.onclick = () => openConflict(b.dataset.conflict));
+  document.querySelectorAll('[data-home]').forEach(b => b.onclick = () => go({ screen: 'chapters', chapter: null }));
 
   const inChapter = route.screen === 'chapter' && chapterById(route.chapter);
   $('#tabs').hidden = !inChapter;
@@ -334,13 +338,21 @@ function renderChapters() {
     $('#toSettings').onclick = () => go({ screen: 'settings' });
     return;
   }
-  v.innerHTML = `<div class="editions" aria-label="Редакция романа">${editions().map(e => `<button class="btn ${e.id === edition ? 'primary' : ''}" data-edition="${esc(e.id)}" aria-pressed="${e.id === edition}">${esc(e.title)}</button>`).join('')}</div>
+  const todo = inbox();
+  v.innerHTML = `${inboxHtml(todo)}
+  <div class="editions" aria-label="Редакция романа">${editions().map(e => {
+    const n = todo.filter(it => editionOf(it.ch) === e.id).length;
+    return `<button class="btn ${e.id === edition ? 'primary' : ''}" data-edition="${esc(e.id)}" aria-pressed="${e.id === edition}">${esc(e.title)} <span class="count">${n || ''}</span></button>`;
+  }).join('')}</div>
   <div class="list">${list.map(ch => {
     const text = chapterText(ch);
     const on = openNotes(ch.id).length, pr = proposalsOf(ch.id).filter(p => p.status === 'pending').length;
+    const answered = agentAnswered(ch.id).length;
     const badges = [
       ch.status ? `<span class="badge ${ch.status === 'черновик' ? 'draft' : ''}">${esc(ch.status)}</span>` : '',
       pendingEdit(ch.id) ? '<span class="badge pending">не отправлено</span>' : '',
+      pr ? '<span class="badge todo">предложение</span>' : '',
+      answered ? '<span class="badge todo">ответ агента</span>' : '',
     ].join('');
     const info = [text ? `${words(text).toLocaleString('ru-RU')} слов` : 'не загружена', on ? `заметок: ${on}` : '', pr ? `предложений: ${pr}` : ''].filter(Boolean).join(' · ');
     return `<button class="item" data-ch="${esc(ch.id)}"><div class="t">${esc(ch.title)}${badges}</div><div class="s">${info}</div></button>`;
@@ -349,7 +361,39 @@ function renderChapters() {
   <div class="row end"><button class="btn" id="toSettings">Настройки</button></div>`;
   v.querySelectorAll('[data-ch]').forEach(b => b.onclick = () => go({ screen: 'chapter', chapter: b.dataset.ch, tab: 'read', proposal: null, version: null }));
   v.querySelectorAll('[data-edition]').forEach(b => b.onclick = () => { ui.edition = b.dataset.edition; save(KEY.ui, ui); go({ screen: 'chapters', chapter: null }); });
+  v.querySelectorAll('[data-inbox]').forEach(b => b.onclick = () => openInboxItem(todo[+b.dataset.inbox]));
   $('#toSettings').onclick = () => go({ screen: 'settings' });
+}
+
+// Что ждёт автора: предложения и ответы агентов во всех редакциях.
+const AGENT_NAMES = ['GPT', 'Claude'];
+const agentAnswered = id => openNotes(id).filter(n => AGENT_NAMES.includes(n.replies?.at(-1)?.by));
+const editionTitle = ch => editions().find(e => e.id === editionOf(ch))?.title || editionOf(ch);
+function inbox() {
+  const items = [];
+  for (const ch of chapters()) {
+    for (const p of proposalsOf(ch.id)) if (p.status === 'pending') items.push({ kind: 'proposal', ch, p, at: p.at || '' });
+    const answered = agentAnswered(ch.id);
+    if (answered.length) items.push({ kind: 'replies', ch, n: answered.length, at: answered.map(n => n.replies.at(-1).at || '').sort().at(-1) });
+  }
+  return items.sort((a, b) => b.at.localeCompare(a.at));
+}
+function inboxHtml(items) {
+  if (!items.length) return '<p class="hint">Новых предложений и ответов агентов нет.</p>';
+  return `<section class="inbox"><h2>Ждёт вас: ${items.length}</h2><div class="list">${items.map((it, i) => `<button class="item todo" data-inbox="${i}">
+      <div class="t">${it.kind === 'proposal' ? `Предложение правок от ${esc(it.p.by || 'агента')}` : `Агент ответил на заметки: ${it.n}`}</div>
+      <div class="where">${esc(it.ch.title)} · ${esc(editionTitle(it.ch))}</div>
+      <div class="s">${it.kind === 'proposal' ? esc((it.p.summary || '').slice(0, 220)) : 'Прочитайте ответы, затем закройте заметку или ответьте.'}</div></button>`).join('')}</div></section>`;
+}
+function openInboxItem(it) {
+  if (!it) return;
+  ui.edition = editionOf(it.ch); save(KEY.ui, ui);
+  if (it.kind === 'proposal') go({ screen: 'chapter', chapter: it.ch.id, tab: 'proposals', proposal: it.p.id, version: null });
+  else go({ screen: 'chapter', chapter: it.ch.id, tab: 'notes', noteFilter: 'open', proposal: null, version: null });
+}
+function afterDecision(word) {
+  const left = inbox().length;
+  return `${word} ${left ? `Ещё ждут вас: ${left}. <button data-home>Показать</button>` : 'Больше ничего не ждёт.'}`;
 }
 
 // --- чтение ---
@@ -559,15 +603,15 @@ function renderProposals(ch) {
       <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
       <div class="c">${esc(p.summary || '')}</div>
       ${stale && p.status === 'pending' ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
-      <p class="hint"><ins class="diff">зелёное</ins> — добавлено, <del>красное</del> — убрано. Неизменённые абзацы свёрнуты.</p>
+      <p class="hint"><ins class="diff">зелёное</ins> — добавлено, <del>красное</del> — убрано. Неизменённые абзацы свёрнуты; серым курсивом — конец абзаца перед правкой, чтобы было видно, где она.</p>
       <div class="diff">${diffHtml(cur || '', text)}</div>
       ${p.status === 'pending' ? `<div class="row end mt">
         <button class="btn danger" id="reject">Отклонить</button>
         <button class="btn primary" id="accept" ${stale ? 'disabled' : ''}>Принять</button></div>` : `<p class="hint">Статус: ${PSTATUS[p.status] || p.status}</p>`}`;
     $('#pback').onclick = () => go({ proposal: null });
     if (p.status === 'pending') {
-      $('#reject').onclick = () => { if (confirm('Отклонить предложение?') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' })) go({ proposal: null }); };
-      $('#accept').onclick = () => { if (confirm('Принять предложение? Текущий текст останется во вкладке «Версии».') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'accepted', base: p.base, text })) go({ proposal: null, tab: 'read' }); };
+      $('#reject').onclick = () => { if (confirm('Отклонить предложение?') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' })) go({ proposal: null }, afterDecision('Предложение отклонено.')); };
+      $('#accept').onclick = () => { if (confirm('Принять предложение? Текущий текст останется во вкладке «Версии».') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'accepted', base: p.base, text })) go({ proposal: null, tab: 'read' }, afterDecision('Предложение принято.')); };
     }
     return;
   }
@@ -599,17 +643,26 @@ function wordDiff(a, b) {
 function diffHtml(oldText, newText) {
   const pa = toLF(oldText).split(/\n{2,}/), pb = toLF(newText).split(/\n{2,}/);
   const ops = lcs(pa, pb);
-  const html = []; let sameRun = 0;
-  const flushSame = () => { if (sameRun) html.push(`<div class="gap">… без изменений: ${sameRun} абз. …</div>`); sameRun = 0; };
+  const html = []; let same = [], places = 0;
+  const clip = s => { s = s.replace(/\s+/g, ' ').trim(); return s.length > 160 ? '…' + s.slice(-160) : s; };
+  const flushSame = beforeChange => {
+    const ctx = beforeChange && same.length ? same.at(-1) : null;
+    const hidden = same.length - (ctx == null ? 0 : 1);
+    if (hidden) html.push(`<div class="gap">… без изменений: ${hidden} абз. …</div>`);
+    if (beforeChange) html.push(`<div class="mark">Правка ${++places}</div>`);
+    if (ctx != null) html.push(`<p class="ctx">${esc(clip(ctx))}</p>`);
+    same = [];
+  };
   for (let k = 0; k < ops.length; k++) {
     const [t, x] = ops[k];
-    if (t === '=') { sameRun++; continue; }
-    flushSame();
+    if (t === '=') { same.push(x); continue; }
+    if (k === 0 || ops[k - 1][0] === '=') flushSame(true);
     if (t === '-' && ops[k + 1]?.[0] === '+') { html.push(`<p>${wordDiff(x, ops[k + 1][1])}</p>`); k++; }
     else html.push(t === '-' ? `<p><del>${esc(x)}</del></p>` : `<p><ins>${esc(x)}</ins></p>`);
   }
-  flushSame();
-  return html.join('') || '<div class="empty">Текст не отличается.</div>';
+  flushSame(false);
+  if (!places) return '<div class="empty">Текст не отличается.</div>';
+  return `<p class="hint">Мест с правками: ${places}.</p>` + html.join('');
 }
 
 // --- версии ---

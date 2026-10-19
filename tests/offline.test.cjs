@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 function worker() {
-  const handlers = {}, entries = new Map(), deleted = [], names = ['unrelated-cache', 'chuzhoy-syn-editor-v1', 'chuzhoy-syn-editor-v2'];
+  const current = fs.readFileSync(path.join(__dirname, '../sw.js'), 'utf8').match(/CACHE = '([^']+)'/)[1];
+  const handlers = {}, entries = new Map(), deleted = [], names = ['unrelated-cache', 'chuzhoy-syn-editor-v1', current];
   let online = true;
   const response = text => ({ ok: true, text, clone() { return response(text); } });
   const root = 'https://example.test/chuzhoy-syn-editor/';

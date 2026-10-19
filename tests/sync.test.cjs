@@ -137,3 +137,17 @@ test('unknown chapter is not silently dropped from queue', async () => {
 test('missing reply target remains in queue', async () => {
   const h=harness();h.run('enqueue({type:"note-reply",chapter:"gpt17",id:"missing",reply:{id:"r1",text:"Ответ"}})');await assert.rejects(h.run('pushQueue()'));assert.equal(h.run('queue.length'),1);
 });
+
+test('inbox lists pending proposals of every edition and hides decided ones', () => {
+  const h=harness();h.put(proposalsPath,JSON.stringify({proposals:[{id:'pv',chapter:'ch03',status:'pending',by:'Claude',summary:'Правка Ваала',file:'p.md'},{id:'pd',chapter:'gpt17',status:'accepted',file:'q.md'}]}));
+  h.run('data.files['+JSON.stringify(proposalsPath)+']='+JSON.stringify({text:h.files.get(proposalsPath).text})+';renderChapters()');
+  const html=h.elements.get('#view').innerHTML;
+  assert.match(html,/Ждёт вас: 1/);assert.match(html,/Правка Ваала/);assert.match(html,/3\. Глава Ваала · Адриан Ваал/);
+  assert.doesNotMatch(html,/data-ch="ch03"/);
+  assert.equal(h.run('inbox()[0].p.id'),'pv');
+});
+
+test('diff marks each changed place and shows preceding context', () => {
+  const h=harness();const html=h.run('diffHtml(' + JSON.stringify('А\n\nБ\n\nВ\n\nГ') + ',' + JSON.stringify('А\n\nБ2\n\nВ\n\nГ2') + ')');
+  assert.match(html,/Мест с правками: 2/);assert.match(html,/Правка 2/);assert.match(html,/class="ctx">А</);
+});
