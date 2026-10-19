@@ -601,6 +601,7 @@ function proposalStatus(p) {
 // Снятые галочки — пока решение не принято, живут только на экране.
 const skips = {};
 const skipOf = id => skips[id] ||= new Set();
+const skipReady = new Set();
 // Свой вариант текста правки — хранится на телефоне до решения по предложению.
 const PEDIT = 'cs.pedit';
 let pedits = load(PEDIT, {});
@@ -660,6 +661,7 @@ function openPartSheet(n) {
     save(PEDIT, pedits);
     const comment = $('#partNote').value.trim();
     if (comment) {
+      if (edits[n] == null) skipOf(p.id).add(n);
       const quote = (edits[n] ?? original ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
       if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
         id: uid('n'), type: 'remark', status: 'open', quote, prefix: '', comment, author: 'автор',
@@ -680,11 +682,13 @@ function renderProposals(ch) {
     const stale = p.base !== data.files[ch.file]?.sha || !!pendingEdit(ch.id);
     const pending = p.status === 'pending';
     const skip = skipOf(p.id), edits = editsOf(p.id);
+    const notesByPart = {};
+    for (const n of partNotes(ch, p)) if (n.status === 'open') (notesByPart[n.part] ||= []).push(n);
+    // Правка с открытым замечанием по умолчанию не принимается — если автор не вписал свой вариант.
+    if (!skipReady.has(p.id)) { skipReady.add(p.id); for (const n of Object.keys(notesByPart)) if (edits[n] == null) skip.add(+n); }
     const total = mergeParts(cur || '', text, new Set()).total;
     const keep = new Set(Array.from({ length: total }, (_, i) => i + 1).filter(n => !skip.has(n)));
     const edited = Object.keys(edits).map(Number).filter(n => keep.has(n));
-    const notesByPart = {};
-    for (const n of partNotes(ch, p)) (notesByPart[n.part] ||= []).push(n);
     v.innerHTML = `<div class="row"><button class="btn" id="pback">‹ Все предложения</button></div>
       <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
       <div class="c">${esc(p.summary || '')}</div>
@@ -701,7 +705,7 @@ function renderProposals(ch) {
       $('#accept').onclick = () => {
         const all = keep.size === total && !edited.length;
         const yours = edited.length ? ` Из них с вашими исправлениями: ${edited.length}.` : '';
-        if (!confirm(keep.size === total ? `Принять все правки?${yours} Текущий текст останется во вкладке «Версии».` : `Принять ${keep.size} из ${total} правок?${yours} Остальные не попадут в главу. Текущий текст останется во вкладке «Версии».`)) return;
+        if (!confirm(keep.size === total ? `Принять все правки?${yours} Текущий текст останется во вкладке «Версии».` : `Принять ${keep.size} из ${total} правок?${yours} Не попадут в главу: ${Array.from({ length: total }, (_, i) => i + 1).filter(n => !keep.has(n)).map(n => `правка ${n}${notesByPart[n] ? ' (с замечанием)' : ''}`).join(', ')}. Текущий текст останется во вкладке «Версии».`)) return;
         const op = { type: 'decide', chapter: ch.id, id: p.id, decision: 'accepted', base: p.base, text };
         if (!all) Object.assign(op, { text: mergeParts(cur || '', text, keep, edits).text, parts: [...keep], total, ...(edited.length ? { edited } : {}) });
         if (enqueue(op)) { dropEdits(p.id); go({ proposal: null, tab: 'read' }, afterDecision(keep.size === total ? 'Предложение принято.' : `Принято правок: ${keep.size} из ${total}.`)); }
@@ -771,9 +775,9 @@ function diffHtml(oldText, newText, mode = ui.diffMode || 'split', pick = null) 
     const hidden = same.length - (ctx == null ? 0 : 1);
     if (hidden) html.push(`<div class="gap">… без изменений: ${hidden} абз. …</div>`);
     if (beforeChange) {
-      const n = ++places, off = pick?.skip?.has(n);
+      const n = ++places, off = pick?.skip?.has(n), remarked = !!pick?.notes?.[n]?.length;
       html.push(`<div class="part${off ? ' off' : ''}"${pick ? ` data-open="${n}"` : ''}>`); inPart = true;
-      html.push(pick ? `<div class="row"><label class="mark pick"><input type="checkbox" data-part="${n}" ${off ? '' : 'checked'}> Правка ${n}${off ? ' — не принимать' : ''}</label><span class="grow"></span><span class="tap">✎ исправить · замечание</span></div>` : `<div class="mark">Правка ${n}</div>`);
+      html.push(pick ? `<div class="row"><label class="mark pick"><input type="checkbox" data-part="${n}" ${off ? '' : 'checked'}> Правка ${n}${off ? (remarked ? ' — не принимать, есть замечание' : ' — не принимать') : ''}</label><span class="grow"></span><span class="tap">✎ исправить · замечание</span></div>` : `<div class="mark">Правка ${n}</div>`);
     }
     if (ctx != null) html.push(`<p class="ctx">${esc(clip(ctx))}</p>`);
     same = [];

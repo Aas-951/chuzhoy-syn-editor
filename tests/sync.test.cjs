@@ -189,3 +189,13 @@ test('diff shows author variant and part remarks', () => {
   const h=harness();const html=h.run('diffHtml('+JSON.stringify('А\n\nБ')+','+JSON.stringify('А\n\nБ2')+',"split",{skip:new Set(),edits:{1:"Мой вариант"},notes:{1:[{comment:"Слишком в лоб"}]}})');
   assert.match(html,/Стало — ваш вариант[\s\S]*Мой вариант/);assert.match(html,/Ваше замечание[\s\S]*Слишком в лоб/);assert.match(html,/data-open="1"/);
 });
+
+test('part with an open remark starts unchecked unless the author wrote own variant', () => {
+  const h=harness();const base=h.files.get(chapter.file).sha;
+  h.put(chapter.file,'А\n\nБ\n\nВ\n\nГ');h.put('p.md','А\n\nБ2\n\nВ\n\nГ2');
+  h.put(proposalsPath,JSON.stringify({proposals:[{id:'pp',chapter:'gpt17',base:h.files.get(chapter.file).sha,status:'pending',file:'p.md'}]}));
+  h.put(notesPath,JSON.stringify({notes:[{id:'n1',status:'open',comment:'Не так',proposal:'pp',part:2,replies:[]}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';route={screen:"chapter",chapter:"gpt17",tab:"proposals",proposal:"pp"};renderProposals(chapterById("gpt17"))');
+  const html=h.elements.get('#view').innerHTML;
+  assert.match(html,/data-part="2" >/);assert.match(html,/data-part="1" checked/);assert.match(html,/есть замечание/);assert.match(html,/Принять отмеченные \(1 из 2\)/);
+});
