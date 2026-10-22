@@ -200,6 +200,18 @@ test('part with an open remark starts unchecked unless the author wrote own vari
   assert.match(html,/data-part="2" >/);assert.match(html,/data-part="1" checked/);assert.match(html,/есть замечание/);assert.match(html,/Принять отмеченные \(1 из 2\)/);
 });
 
+test('proposal can be read as clean text with checked changes; reader links to it', () => {
+  const h=harness();
+  h.put(chapter.file,'А\n\nБ\n\nВ\n\nГ');h.put('p.md','А\n\nБ2\n\nВ\n\nГ2');
+  h.put(proposalsPath,JSON.stringify({proposals:[{id:'pp',chapter:'gpt17',by:'Claude',base:h.files.get(chapter.file).sha,status:'pending',file:'p.md'}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';skipOf("pp").add(1);route={screen:"chapter",chapter:"gpt17",tab:"proposals",proposal:"pp",clean:true};renderProposals(chapterById("gpt17"))');
+  let html=h.elements.get('#view').innerHTML;
+  assert.match(html,/<article class="article"><p>А<\/p><p>Б<\/p><p>В<\/p><p>Г2<\/p><\/article>/);assert.doesNotMatch(html,/<ins>|<del>/);
+  assert.match(html,/отмеченные правки: 1 из 2/);assert.match(html,/Принять отмеченные \(1 из 2\)/);
+  h.run('route={screen:"chapter",chapter:"gpt17",tab:"read"};renderRead(chapterById("gpt17"))');
+  html=h.elements.get('#view').innerHTML;assert.match(html,/id="readNew"/);
+});
+
 test('paragraph view lists paragraphs and attaches notes; raw editor on request', () => {
   const h=harness();h.put(chapter.file,'## Глава\n\nПервый абзац.\n\nВторой абзац тут.\n');
   h.put(notesPath,JSON.stringify({notes:[{id:'n1',type:'remark',status:'open',quote:'Второй абзац',comment:'Сократить',replies:[]}]}));

@@ -390,7 +390,7 @@ function inboxHtml(items) {
 function openInboxItem(it) {
   if (!it) return;
   ui.edition = editionOf(it.ch); save(KEY.ui, ui);
-  if (it.kind === 'proposal') go({ screen: 'chapter', chapter: it.ch.id, tab: 'proposals', proposal: it.p.id, version: null });
+  if (it.kind === 'proposal') go({ screen: 'chapter', chapter: it.ch.id, tab: 'proposals', proposal: it.p.id, version: null, clean: false });
   else go({ screen: 'chapter', chapter: it.ch.id, tab: 'notes', noteFilter: 'open', proposal: null, version: null });
 }
 function afterDecision(word) {
@@ -409,16 +409,23 @@ function mdToHtml(text) {
   }).join('');
 }
 
+function readSize() {
+  const set = () => document.documentElement.style.setProperty('--read-size', ui.size + 'px');
+  set();
+  $('#smaller').onclick = () => { ui.size = Math.max(14, ui.size - 1); save(KEY.ui, ui); set(); };
+  $('#bigger').onclick = () => { ui.size = Math.min(28, ui.size + 1); save(KEY.ui, ui); set(); };
+}
 function renderRead(ch) {
   const text = chapterText(ch);
   const v = $('#view');
   if (text == null) { v.innerHTML = '<div class="empty">Глава ещё не загружена — нужен Интернет.</div>'; return; }
+  const waiting = proposalsOf(ch.id).filter(p => p.status === 'pending' && data.files[p.file]).sort((a, b) => (b.at || '').localeCompare(a.at || ''))[0];
   v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button></div>
     ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
+    ${waiting ? `<div class="row"><span class="hint grow">Это текст до правок. Есть предложение от ${esc(waiting.by || 'агента')}.</span><button class="btn" id="readNew">Читать с правками</button></div>` : ''}
     <article class="article" id="article">${mdToHtml(text)}</article>`;
-  document.documentElement.style.setProperty('--read-size', ui.size + 'px');
-  $('#smaller').onclick = () => { ui.size = Math.max(14, ui.size - 1); save(KEY.ui, ui); document.documentElement.style.setProperty('--read-size', ui.size + 'px'); };
-  $('#bigger').onclick = () => { ui.size = Math.min(28, ui.size + 1); save(KEY.ui, ui); document.documentElement.style.setProperty('--read-size', ui.size + 'px'); };
+  readSize();
+  if (waiting) $('#readNew').onclick = () => go({ tab: 'proposals', proposal: waiting.id, clean: true });
   highlightNotes(ch);
   if (route.scrollTo) { const id = route.scrollTo; route.scrollTo = null; scrollToNote(ch, id); }
 }
@@ -757,17 +764,27 @@ function renderProposals(ch) {
     const total = mergeParts(cur || '', text, new Set()).total;
     const keep = new Set(Array.from({ length: total }, (_, i) => i + 1).filter(n => !skip.has(n)));
     const edited = Object.keys(edits).map(Number).filter(n => keep.has(n));
+    // «Читать с правками» — глава целиком, как она станет после принятия отмеченных правок, без пометок.
+    const clean = !!route.clean;
+    const views = `<div class="filters pviews"><button data-pview="diff" class="${clean ? '' : 'on'}">Правки</button><button data-pview="clean" class="${clean ? 'on' : ''}">Читать с правками</button></div>`;
+    const body = clean
+      ? `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button></div>
+        ${pending && keep.size < total ? `<p class="hint">Показаны только отмеченные правки: ${keep.size} из ${total}.</p>` : ''}
+        <article class="article">${mdToHtml(pending ? mergeParts(cur || '', text, keep, edits).text : text)}</article>`
+      : `<p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.${pending ? ' Снимите галочку у правки, которую не хотите принимать. Нажмите на саму правку, чтобы исправить её или оставить замечание.' : ''}</p>
+      <div class="diff">${diffHtml(cur || '', text, undefined, pending ? { skip, edits, notes: notesByPart } : null)}</div>`;
     v.innerHTML = `<div class="row"><button class="btn" id="pback">‹ Все предложения</button></div>
       <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
       <div class="c">${esc(p.summary || '')}</div>
       ${stale && pending ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
-      <p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.${pending ? ' Снимите галочку у правки, которую не хотите принимать. Нажмите на саму правку, чтобы исправить её или оставить замечание.' : ''}</p>
-      <div class="diff">${diffHtml(cur || '', text, undefined, pending ? { skip, edits, notes: notesByPart } : null)}</div>
+      ${views}${body}
       ${pending ? `<div class="row end actbar">
         <button class="btn danger" id="reject">Отклонить всё</button>
         <button class="btn primary" id="accept" ${stale || !keep.size ? 'disabled' : ''}>${keep.size === total ? `Принять все (${total})` : `Принять отмеченные (${keep.size} из ${total})`}</button></div>`
         : `<p class="hint">Статус: ${proposalStatus(p)}</p>`}`;
-    $('#pback').onclick = () => go({ proposal: null });
+    $('#pback').onclick = () => go({ proposal: null, clean: false });
+    v.querySelectorAll('[data-pview]').forEach(b => b.onclick = () => go({ clean: b.dataset.pview === 'clean' }));
+    if (clean) readSize();
     if (pending) {
       $('#reject').onclick = () => { if (confirm('Отклонить всё предложение?') && enqueue({ type: 'decide', chapter: ch.id, id: p.id, decision: 'rejected' })) { dropEdits(p.id); go({ proposal: null }, afterDecision('Предложение отклонено.')); } };
       $('#accept').onclick = () => {
@@ -785,7 +802,7 @@ function renderProposals(ch) {
       <div class="t">${esc(p.by || 'Агент')}<span class="badge ${p.status === 'pending' ? 'pending' : ''}">${proposalStatus(p)}${p.local ? ', не отправлено' : ''}</span></div>
       <div class="s">${fmtDate(p.at)} — ${esc((p.summary || '').slice(0, 160))}</div></button>`).join('')}</div>`
     : '<div class="empty">Предложений нет. Попросите агента в T3: «обработай заметки к этой главе».</div>';
-  v.querySelectorAll('[data-p]').forEach(b => b.onclick = () => go({ proposal: b.dataset.p }));
+  v.querySelectorAll('[data-p]').forEach(b => b.onclick = () => go({ proposal: b.dataset.p, clean: false }));
 }
 
 // Сравнение: по абзацам, внутри изменённых — по словам.
@@ -977,7 +994,7 @@ $('#back').onclick = () => {
   go({ screen: 'chapters', chapter: null });
 };
 $('#sync').onclick = () => cfg.token ? sync() : go({ screen: 'settings' });
-document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null, rawEdit: false }));
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null, rawEdit: false, clean: false }));
 document.addEventListener('change', e => {
   const c = e.target.closest?.('[data-part]'); if (!c || !route.proposal) return;
   const s = skipOf(route.proposal), n = +c.dataset.part, y = c.getBoundingClientRect().top;
