@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 10; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 11; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -191,6 +191,15 @@ async function pushQueue() {
     if (!ch) throw new Error('Глава предложения недоступна. Решение остаётся на телефоне.');
     const currentProposals = await getFile(PROPOSALS);
     const proposal = JSON.parse(currentProposals?.text || '{"proposals":[]}').proposals.find(p => p.id === op.id);
+    // The status PUT may have succeeded before the connection dropped. An exact
+    // operation receipt proves completion even if the author edited the chapter later.
+    if (proposal?.chapter === op.chapter && (op.operationId && proposal.decisionOperationId === op.operationId ||
+        !proposal.decisionOperationId && proposal.decidedAt === op.at &&
+        (proposal.status === op.decision || op.decision === 'accepted' && proposal.status === 'stale'))) {
+      data.files[PROPOSALS] = currentProposals;
+      if (!saveData()) throw new Error('Не удалось сохранить подтверждение решения.');
+      drop(op); continue;
+    }
     if (!proposal || proposal.chapter !== op.chapter || !['pending', op.decision].includes(proposal.status)) throw new Error('Предложение уже изменилось. Решение остаётся на телефоне.');
     if (op.decision === 'accepted' && proposal.base !== op.base) throw new Error('Основа предложения изменилась. Решение остаётся на телефоне.');
     let decision = op.decision;
@@ -200,11 +209,20 @@ async function pushQueue() {
       else if (!cur || cur.sha !== op.base) decision = 'stale';
       else await putFile(ch.file, withEol(op.text, eolOf(cur.text)), cur.sha, `${op.parts ? `Частично (${op.parts.length} из ${op.total}) принято` : 'Принято'} предложение ${op.id}: ${ch.title}`);
     }
+    if (decision === 'stale' && op.edited?.length) {
+      // This text contains the author's own wording, not just the agent's
+      // proposal. A stale base must never make that wording disappear.
+      const path = conflictPath(ch.id, 'proposal-' + (op.operationId || op.at.replace(/[^a-zA-Z0-9-]/g, '-')));
+      const existing = await getFile(path);
+      if (existing && toLF(existing.text) !== toLF(op.text)) throw new Error('Ваш вариант уже сохранён с другим текстом. Решение остаётся в очереди.');
+      if (!existing) await putFile(path, op.text, null, `Вариант автора из устаревшего предложения ${op.id}: ${ch.title}`);
+      addConflict({ chapter: ch.id, path, proposal: op.id, at: op.at });
+    }
     await updateJSON(PROPOSALS, { proposals: [] }, j => {
       const p = (j.proposals || []).find(p => p.id === op.id);
       if (!p) throw new Error('Предложение не найдено. Решение сохранено в очереди.');
       if (p.status !== 'pending' && p.status !== decision) throw new Error('Решение по предложению уже изменилось. Обновите редактор.');
-      p.status = decision; p.decidedAt = op.at;
+      p.status = decision; p.decidedAt = op.at; p.decisionOperationId = op.operationId;
       if (decision === 'accepted' && op.parts) { p.acceptedParts = op.parts; p.partsTotal = op.total; }
       if (decision === 'accepted' && op.edited) p.editedParts = op.edited;
     }, `Решение по предложению ${op.id}: ${decision}${op.parts && decision === 'accepted' ? ` (правки ${op.parts.join(', ')} из ${op.total})` : ''}`);
@@ -267,7 +285,7 @@ async function pull() {
   const nextProposals = JSON.parse(staged[PROPOSALS]?.text || '{"proposals":[]}');
   if (!Array.isArray(nextManifest.chapters) || !Array.isArray(nextProposals.proposals)) throw new Error('Повреждён список глав или предложений.');
   for (const ch of nextManifest.chapters) { want.add(ch.file); want.add(notesPath(ch.id)); }
-  for (const p of nextProposals.proposals) if (p.status === 'pending') want.add(p.file);
+  for (const p of nextProposals.proposals) if (p.status === 'pending' || p.id === route.proposal) want.add(p.file);
   for (const c of data.conflicts || []) want.add(c.path);
   for (const path of want) await fetchIfChanged(path);
   for (const path of Object.keys(staged)) if (!want.has(path)) delete staged[path];
@@ -299,21 +317,46 @@ function renderStatus() {
 }
 
 let notice = '';
+let updateAvailable = false;
+let waitingWorker = null, applyingUpdate = false;
+function requestAppUpdate(worker = null) {
+  updateAvailable = true;
+  if (worker) waitingWorker = worker;
+  // A service-worker update must not interrupt typing or reset a proposal review.
+  if (!syncing && !$('#sheet').open && route.screen === 'chapters') return applyAppUpdate();
+  renderBanner();
+}
+function applyAppUpdate() {
+  if (syncing || $('#sheet').open) return alert('Сначала сохраните или закройте открытое окно и дождитесь синхронизации.');
+  if (waitingWorker) {
+    applyingUpdate = true;
+    waitingWorker.postMessage({ type: 'ACTIVATE_UPDATE' });
+    waitingWorker = null;
+    return;
+  }
+  location.reload();
+}
 function go(r, msg = '') { notice = msg; route = { ...route, ...r }; window.scrollTo(0, 0); render(); }
 
-function render() {
-  renderStatus();
+function renderBanner() {
   const msgs = [];
   if (syncError) msgs.push(esc(syncError));
   const conflicts = data.conflicts || [];
   for (const c of conflicts) {
     const ch = chapterById(c.chapter);
-    msgs.push(`Конфликт в «${esc(ch?.title || c.chapter)}»: глава изменилась, пока вы правили без сети. Ваша версия сохранена отдельно. <button data-conflict="${esc(c.path)}">Открыть</button>`);
+    msgs.push(`Конфликт в «${esc(ch?.title || c.chapter)}»: глава успела измениться. Ваш вариант сохранён отдельно. <button data-conflict="${esc(c.path)}">Открыть</button>`);
   }
   if (notice) msgs.push(notice);
+  if (updateAvailable) msgs.push('Готово обновление редактора. <button data-update>Обновить</button> — после сохранения работы.');
   banner(msgs.join('<br>'), !!syncError || conflicts.length > 0);
   document.querySelectorAll('[data-conflict]').forEach(b => b.onclick = () => openConflict(b.dataset.conflict));
   document.querySelectorAll('[data-home]').forEach(b => b.onclick = () => go({ screen: 'chapters', chapter: null }));
+  document.querySelectorAll('[data-update]').forEach(b => b.onclick = applyAppUpdate);
+}
+
+function render() {
+  renderStatus();
+  renderBanner();
 
   const inChapter = route.screen === 'chapter' && chapterById(route.chapter);
   $('#tabs').hidden = !inChapter;
@@ -570,6 +613,7 @@ function renderParagraphs(ch, text) {
 }
 function paraSheet(ch, i) {
   const base = chapterText(ch); if (base == null) return;
+  const baseSha = pendingEdit(ch.id)?.base || data.files[ch.file]?.sha;
   const parts = splitParas(base), original = parts[i]; if (original == null) return;
   const d = $('#sheet');
   delete d.dataset.conflict;
@@ -592,14 +636,13 @@ function paraSheet(ch, i) {
     if (!changed && !comment) return d.close();
     if (changed) {
       parts[i] = value + (original.match(/\s*$/)[0]);
-      const prev = pendingEdit(ch.id);
-      if (!enqueue({ type: 'edit', chapter: ch.id, base: prev ? prev.base : data.files[ch.file]?.sha, text: parts.join('') })) return;
+      if (!enqueue({ type: 'edit', chapter: ch.id, base: baseSha, text: parts.join('') })) return;
     }
     if (comment) {
       const quote = (value || original).replace(/\s+/g, ' ').trim().slice(0, 300);
       if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
         id: uid('n'), type: d.querySelector('input[name=type]:checked').value, status: 'open', quote, prefix: '', comment,
-        author: 'автор', createdAt: new Date().toISOString(), chapterSha: pendingEdit(ch.id) ? null : data.files[ch.file]?.sha || null, replies: [],
+        author: 'автор', createdAt: new Date().toISOString(), chapterSha: changed || pendingEdit(ch.id) ? null : baseSha || null, replies: [],
       } })) return;
     }
     d.close(); render();
@@ -674,10 +717,45 @@ function proposalStatus(p) {
   const base = p.acceptedParts.length === p.partsTotal ? 'принято' : `принято частично: ${p.acceptedParts.length} из ${p.partsTotal}`;
   return base + (p.editedParts?.length ? `, с вашими исправлениями: ${p.editedParts.length}` : '');
 }
-// Снятые галочки — пока решение не принято, живут только на экране.
+// Keep review choices across browser and service-worker reloads, scoped to the
+// exact proposal base and blob so part numbers cannot drift into another text.
+const PCHOICES = 'cs.pchoices';
+let pchoices = load(PCHOICES, {});
 const skips = {};
-const skipOf = id => skips[id] ||= new Set();
-const skipReady = new Set();
+const skipOf = id => skips[id] ||= new Set(pchoices[id]?.skip || []);
+function saveChoices(id) {
+  const next = { ...pchoices, [id]: { ...(pchoices[id] || {}), skip: [...skipOf(id)] } };
+  if (!save(PCHOICES, next)) return false;
+  pchoices = next; return true;
+}
+function selectPart(id, n, checked) {
+  const s = skipOf(id), before = s.has(n);
+  checked ? s.delete(n) : s.add(n);
+  if (saveChoices(id)) return true;
+  before ? s.add(n) : s.delete(n); return false;
+}
+function prepareChoices(p, notes) {
+  const blob = data.files[p.file]?.sha;
+  let choice = pchoices[p.id];
+  if (choice && (choice.base !== p.base || choice.blob !== blob)) {
+    // An agent should never reuse an ID for another proposal; do not apply an
+    // old checked-part map to different text if it nevertheless happens.
+    choice = null; skips[p.id] = new Set();
+  }
+  const before = pchoices[p.id];
+  pchoices[p.id] = choice || { base: p.base, blob, skip: [...skipOf(p.id)], seenNotes: [] };
+  const seen = new Set(pchoices[p.id].seenNotes || []);
+  const previousSkip = new Set(skipOf(p.id));
+  for (const n of notes) if (n.status === 'open' && !seen.has(n.id)) {
+    if (editsOf(p.id)[n.part] == null) skipOf(p.id).add(+n.part);
+    seen.add(n.id);
+  }
+  pchoices[p.id] = { ...pchoices[p.id], seenNotes: [...seen] };
+  if (!saveChoices(p.id)) {
+    if (before) pchoices[p.id] = before; else delete pchoices[p.id];
+    skips[p.id] = previousSkip;
+  }
+}
 // Свой вариант текста правки — хранится на телефоне до решения по предложению.
 const PEDIT = 'cs.pedit';
 let pedits = load(PEDIT, {});
@@ -714,7 +792,7 @@ const partNotes = (ch, p) => notesOf(ch.id).filter(n => n.proposal === p.id);
 function openPartSheet(n) {
   const ch = chapterById(route.chapter);
   const p = ch && proposalsOf(ch.id).find(p => p.id === route.proposal);
-  if (!p || p.status !== 'pending' || !data.files[p.file]) return;
+  if (!p || p.status !== 'pending' || !data.files[p.file] || p.base !== data.files[ch.file]?.sha || pendingEdit(ch.id)) return;
   const part = diffParts(chapterText(ch) || '', toLF(data.files[p.file].text))[n - 1]; if (!part) return;
   const edits = editsOf(p.id), original = part.now.join('\n\n');
   const d = $('#sheet');
@@ -734,18 +812,32 @@ function openPartSheet(n) {
   $('#ok').onclick = () => {
     const value = toLF($('#partText').value);
     if (value.trim() !== original.trim()) { edits[n] = value; skipOf(p.id).delete(n); } else delete edits[n];
-    save(PEDIT, pedits);
+    if (!save(PEDIT, pedits) || !saveChoices(p.id)) return;
     const comment = $('#partNote').value.trim();
     if (comment) {
-      if (edits[n] == null) skipOf(p.id).add(n);
+      if (edits[n] == null && !selectPart(p.id, n, false)) return;
       const quote = (edits[n] ?? original ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
       if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
         id: uid('n'), type: 'remark', status: 'open', quote, prefix: '', comment, author: 'автор',
-        createdAt: new Date().toISOString(), chapterSha: data.files[ch.file]?.sha || null, replies: [], proposal: p.id, part: n,
+        createdAt: new Date().toISOString(), chapterSha: p.base, replies: [], proposal: p.id, part: n,
       } })) return;
     }
     d.close(); render();
   };
+}
+async function loadProposal(ch, p) {
+  const active = () => route.screen === 'chapter' && route.chapter === ch.id && route.tab === 'proposals' && route.proposal === p.id;
+  try {
+    const file = await getFile(p.file);
+    if (!active()) return;
+    if (!file) throw new Error('Файл предложения не найден.');
+    data.files[p.file] = file;
+    if (!saveData()) return;
+    renderProposals(ch);
+  } catch (e) {
+    if (active()) $('#view').innerHTML = `<div class="empty">Не удалось загрузить предложение: ${esc(e.detail || e.message)}</div><button class="btn" id="pback">‹ Назад</button>`;
+    if (active()) $('#pback').onclick = () => go({ proposal: null });
+  }
 }
 function renderProposals(ch) {
   const v = $('#view');
@@ -754,35 +846,41 @@ function renderProposals(ch) {
     const p = list.find(p => p.id === route.proposal);
     const text = p && data.files[p.file] ? toLF(data.files[p.file].text) : null;
     const cur = chapterText(ch);
-    if (!p || text == null) { v.innerHTML = '<div class="empty">Текст предложения не загружен — нужен Интернет.</div><div class="row"><button class="btn" id="pback">‹ Назад</button></div>'; $('#pback').onclick = () => go({ proposal: null }); return; }
+    if (!p || text == null) {
+      v.innerHTML = `<div class="empty">${p && navigator.onLine ? 'Загружаю предложение…' : 'Текст предложения не загружен — нужен Интернет.'}</div><div class="row"><button class="btn" id="pback">‹ Назад</button></div>`;
+      $('#pback').onclick = () => go({ proposal: null });
+      if (p && navigator.onLine) loadProposal(ch, p);
+      return;
+    }
     const stale = p.base !== data.files[ch.file]?.sha || !!pendingEdit(ch.id);
     const pending = p.status === 'pending';
+    if (pending && !stale) prepareChoices(p, partNotes(ch, p));
     const skip = skipOf(p.id), edits = editsOf(p.id);
     const notesByPart = {};
     for (const n of partNotes(ch, p)) if (n.status === 'open') (notesByPart[n.part] ||= []).push(n);
     // Правка с открытым замечанием по умолчанию не принимается — если автор не вписал свой вариант.
-    if (!skipReady.has(p.id)) { skipReady.add(p.id); for (const n of Object.keys(notesByPart)) if (edits[n] == null) skip.add(+n); }
     const total = mergeParts(cur || '', text, new Set()).total;
     const keep = new Set(Array.from({ length: total }, (_, i) => i + 1).filter(n => !skip.has(n)));
     const edited = Object.keys(edits).map(Number).filter(n => keep.has(n));
     // «Читать с правками» — глава целиком, как она станет после принятия отмеченных правок, без пометок.
     const clean = !!route.clean;
-    const views = `<div class="filters pviews"><button data-pview="diff" class="${clean ? '' : 'on'}">Правки</button><button data-pview="clean" class="${clean ? 'on' : ''}">Читать с правками</button></div>`;
+    const views = `<div class="filters pviews"><button data-pview="diff" class="${clean ? '' : 'on'}">Правки</button><button data-pview="clean" class="${clean ? 'on' : ''}">${pending ? 'Читать с правками' : 'Текст предложения'}</button></div>`;
     const body = clean
       ? `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button></div>
-        ${pending && keep.size < total ? `<p class="hint">Показаны только отмеченные правки: ${keep.size} из ${total}.</p>` : ''}
-        <article class="article">${mdToHtml(pending ? mergeParts(cur || '', text, keep, edits).text : text)}</article>`
+        ${pending && !stale && keep.size < total ? `<p class="hint">Показаны только отмеченные правки: ${keep.size} из ${total}.</p>` : ''}
+        <article class="article">${mdToHtml(pending && !stale ? mergeParts(cur || '', text, keep, edits).text : text)}</article>`
       : `<p class="hint">Красным — что убрано, зелёным — что добавлено. Неизменённые абзацы свёрнуты, серым курсивом — конец абзаца перед правкой. Вид сравнения переключается кнопками ниже.${pending ? ' Снимите галочку у правки, которую не хотите принимать. Нажмите на саму правку, чтобы исправить её или оставить замечание.' : ''}</p>
-      <div class="diff">${diffHtml(cur || '', text, undefined, pending ? { skip, edits, notes: notesByPart } : null)}</div>`;
+      <div class="diff">${diffHtml(cur || '', text, undefined, pending && !stale ? { skip, edits, notes: notesByPart } : null)}</div>`;
     v.innerHTML = `<div class="row"><button class="btn" id="pback">‹ Все предложения</button></div>
       <h3>${esc(p.by || 'Агент')} · ${fmtDate(p.at)}</h3>
       <div class="c">${esc(p.summary || '')}</div>
+      ${p.status === 'accepted' ? '<p class="hint">Это исходный текст предложения агента. В главу попали только принятые вами правки с вашими исправлениями. Действующий текст — во вкладке «Читать».</p>' : ''}
       ${stale && pending ? '<p class="bad">Глава изменилась после того, как агент подготовил это предложение. Принять нельзя — попросите агента обновить его.</p>' : ''}
       ${views}${body}
       ${pending ? `<div class="row end actbar">
         <button class="btn danger" id="reject">Отклонить всё</button>
         <button class="btn primary" id="accept" ${stale || !keep.size ? 'disabled' : ''}>${keep.size === total ? `Принять все (${total})` : `Принять отмеченные (${keep.size} из ${total})`}</button></div>`
-        : `<p class="hint">Статус: ${proposalStatus(p)}</p>`}`;
+        : `<p class="hint">Статус: ${esc(proposalStatus(p))}</p>`}`;
     $('#pback').onclick = () => go({ proposal: null, clean: false });
     v.querySelectorAll('[data-pview]').forEach(b => b.onclick = () => go({ clean: b.dataset.pview === 'clean' }));
     if (clean) readSize();
@@ -800,7 +898,7 @@ function renderProposals(ch) {
     return;
   }
   v.innerHTML = list.length ? `<div class="list">${list.map(p => `<button class="item" data-p="${esc(p.id)}">
-      <div class="t">${esc(p.by || 'Агент')}<span class="badge ${p.status === 'pending' ? 'pending' : ''}">${proposalStatus(p)}${p.local ? ', не отправлено' : ''}</span></div>
+      <div class="t">${esc(p.by || 'Агент')}<span class="badge ${p.status === 'pending' ? 'pending' : ''}">${esc(proposalStatus(p))}${p.local ? ', не отправлено' : ''}</span></div>
       <div class="s">${fmtDate(p.at)} — ${esc((p.summary || '').slice(0, 160))}</div></button>`).join('')}</div>`
     : '<div class="empty">Предложений нет. Попросите агента в T3: «обработай заметки к этой главе».</div>';
   v.querySelectorAll('[data-p]').forEach(b => b.onclick = () => go({ proposal: b.dataset.p, clean: false }));
@@ -887,35 +985,40 @@ function diffHtml(oldText, newText, mode = ui.diffMode || 'split', pick = null) 
 }
 
 // --- версии ---
+let historyRequest = 0;
 async function renderHistory(ch) {
+  const request = ++historyRequest, version = route.version;
+  const active = () => request === historyRequest && route.screen === 'chapter' && route.tab === 'history' &&
+    route.chapter === ch.id && route.version?.sha === version?.sha;
   const v = $('#view');
   if (!navigator.onLine) { v.innerHTML = '<div class="empty">Версии доступны только с Интернетом. Каждая сохранённая правка хранится в GitHub.</div>'; return; }
   if (route.version) {
     v.innerHTML = '<div class="empty">Загружаю…</div>';
     try {
-      const f = await getFile(ch.file, route.version.sha);
+      const f = await getFile(ch.file, version.sha);
+      if (!active()) return;
       const text = f ? toLF(f.text) : '';
       v.innerHTML = `<div class="row"><button class="btn" id="vback">‹ Все версии</button><span class="grow"></span><button class="btn" id="restore">Вернуть эту версию</button></div>
-        <p class="hint">${esc(route.version.msg)} · ${fmtDate(route.version.date)}</p>
+        <p class="hint">${esc(version.msg)} · ${fmtDate(version.date)}</p>
         <details><summary class="hint">Чем отличается от текущего текста</summary><div class="diff">${diffHtml(chapterText(ch) || '', text)}</div></details>
         <article class="article">${mdToHtml(text)}</article>`;
       $('#vback').onclick = () => go({ version: null });
       $('#restore').onclick = () => {
         if (!confirm('Вернуть главу к этой версии? Текущий текст тоже останется в истории.')) return;
         const prev = pendingEdit(ch.id);
-        enqueue({ type: 'edit', chapter: ch.id, base: prev ? prev.base : data.files[ch.file]?.sha, text });
-        go({ version: null, tab: 'read' });
+        if (enqueue({ type: 'edit', chapter: ch.id, base: prev ? prev.base : data.files[ch.file]?.sha, text })) go({ version: null, tab: 'read' });
       };
-    } catch (e) { v.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(e.detail || e.message)}</div>`; }
+    } catch (e) { if (active()) v.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(e.detail || e.message)}</div>`; }
     return;
   }
   v.innerHTML = '<div class="empty">Загружаю историю…</div>';
   try {
     const list = await gh(`${repoPath()}/commits?path=${encodeURIComponent(ch.file)}&sha=${encodeURIComponent(branch())}&per_page=40`);
+    if (!active()) return;
     v.innerHTML = `<div class="list">${list.map(c => `<button class="item" data-v="${esc(c.sha)}" data-msg="${esc(c.commit.message.split('\n')[0])}" data-date="${esc(c.commit.author.date)}">
       <div class="t">${esc(c.commit.message.split('\n')[0])}</div><div class="s">${fmtDate(c.commit.author.date)}</div></button>`).join('')}</div>`;
     v.querySelectorAll('[data-v]').forEach(b => b.onclick = () => go({ version: { sha: b.dataset.v, msg: b.dataset.msg, date: b.dataset.date } }));
-  } catch (e) { v.innerHTML = `<div class="empty">Не удалось загрузить историю: ${esc(e.detail || e.message)}</div>`; }
+  } catch (e) { if (active()) v.innerHTML = `<div class="empty">Не удалось загрузить историю: ${esc(e.detail || e.message)}</div>`; }
 }
 
 async function openConflict(path) {
@@ -999,8 +1102,8 @@ $('#sync').onclick = () => cfg.token ? sync() : go({ screen: 'settings' });
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => go({ tab: b.dataset.tab, proposal: null, version: null, rawEdit: false, clean: false }));
 document.addEventListener('change', e => {
   const c = e.target.closest?.('[data-part]'); if (!c || !route.proposal) return;
-  const s = skipOf(route.proposal), n = +c.dataset.part, y = c.getBoundingClientRect().top;
-  c.checked ? s.delete(n) : s.add(n);
+  const n = +c.dataset.part, y = c.getBoundingClientRect().top;
+  if (!selectPart(route.proposal, n, c.checked)) c.checked = !c.checked;
   render();
   const again = document.querySelector(`[data-part="${n}"]`);
   if (again) window.scrollBy(0, again.getBoundingClientRect().top - y);
@@ -1021,10 +1124,21 @@ addEventListener('offline', renderStatus);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); });
 setInterval(() => { if (document.visibilityState === 'visible') sync(); }, 5 * 60 * 1000);
 if ('serviceWorker' in navigator) {
-  // Когда приходит новая версия редактора, страница перезагружается сама (черновики хранятся в памяти телефона).
+  // Reload automatically only on the idle home screen; active forms and proposal
+  // reviews get an update button instead of losing unsaved input.
   const hadController = !!navigator.serviceWorker.controller;
-  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController) location.reload(); });
-  navigator.serviceWorker.register('sw.js').then(reg => document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); })).catch(() => {});
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (hadController) { if (applyingUpdate) location.reload(); else requestAppUpdate(); }
+  });
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    const ready = () => { if (reg.waiting) requestAppUpdate(reg.waiting); };
+    ready();
+    reg.addEventListener('updatefound', () => {
+      const worker = reg.installing;
+      worker?.addEventListener('statechange', () => { if (worker.state === 'installed') ready(); });
+    });
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+  }).catch(() => {});
 }
 if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
 

@@ -10,13 +10,13 @@ const chapter = { id: 'gpt17', edition: 'gpt', title: '17. Глава Codex', fi
 const vaal = { id: 'ch03', edition: 'vaal', title: '3. Глава Ваала', file: 'vaal.md' };
 const sha = text => crypto.createHash('sha1').update('blob ' + Buffer.byteLength(text) + '\0').update(text).digest('hex');
 
-function harness() {
-  const files = new Map(), storage = new Map(), elements = new Map();
+function harness(savedStorage = []) {
+  const files = new Map(), storage = new Map(savedStorage), elements = new Map();
   const put = (path, text) => files.set(path, { text, sha: sha(text) });
   put(manifestPath, JSON.stringify({ editions: [{ id: 'gpt', title: 'Codex · 17 глав' }, { id: 'vaal', title: 'Адриан Ваал' }], chapters: [vaal, chapter] }));
   put(proposalsPath, '{"proposals":[]}'); put(chapter.file, 'Исходный текст'); put(vaal.file, 'Ваал');
   let onRequest = null, failStorage = false, calls = 0;
-  const node = () => ({ innerHTML: '', textContent: '', hidden: false, open: false, classList: { toggle() {} }, querySelectorAll() { return []; } });
+  const node = () => ({ innerHTML: '', textContent: '', value: '', dataset: {}, hidden: false, open: false, classList: { toggle() {} }, querySelectorAll() { return []; }, querySelector() { return { value: 'remark' }; }, showModal() { this.open = true; }, close() { this.open = false; }, focus() {} });
   const ctx = vm.createContext({ console, TextEncoder, TextDecoder, Uint8Array, URL, Date,
     atob: x => Buffer.from(x, 'base64').toString('binary'), btoa: x => Buffer.from(x, 'binary').toString('base64'),
     setTimeout() { return 1; }, clearTimeout() {}, setInterval() {}, alert() {}, confirm() { return true; },
@@ -221,4 +221,125 @@ test('paragraph view lists paragraphs and attaches notes; raw editor on request'
   h.run('route.rawEdit=true;renderEdit(chapterById("gpt17"))');html=h.elements.get('#view').innerHTML;
   assert.match(html,/textarea class="editor"/);
   assert.equal(h.run('JSON.stringify(splitParas('+JSON.stringify('а\n\nб\n')+'))'),JSON.stringify(['а','\n\n','б\n']));
+});
+
+test('paragraph opened before sync keeps its original base and cannot overwrite a newer chapter', async () => {
+  const h = harness();
+  h.put(chapter.file, 'Первый абзац.\n\nВторой абзац.');
+  h.run('data.files=' + JSON.stringify(Object.fromEntries(h.files)) + ';paraSheet(chapterById("gpt17"),0)');
+  h.elements.get('#paraText').value = 'Моя правка первого.';
+  h.elements.get('#paraNote').value = '';
+  h.put(chapter.file, 'Первый абзац.\n\nНовая правка второго от агента.');
+  await h.run('pull()');
+  h.elements.get('#ok').onclick();
+  await h.run('pushQueue()');
+  assert.equal(h.files.get(chapter.file).text, 'Первый абзац.\n\nНовая правка второго от агента.');
+  assert.equal([...h.files].find(([path]) => path.includes('конфликты'))[1].text, 'Моя правка первого.\n\nВторой абзац.');
+});
+
+test('failed author-variant save leaves the edit dialog open', () => {
+  const h=harness();
+  h.put('p.md','Новый абзац.');
+  h.put(proposalsPath,JSON.stringify({proposals:[{id:'p1',chapter:'gpt17',base:h.files.get(chapter.file).sha,status:'pending',file:'p.md'}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';route={chapter:"gpt17",proposal:"p1"};openPartSheet(1)');
+  h.elements.get('#partText').value='Мой вариант, который нельзя потерять.';
+  h.run('$("#partNote").value=""');h.quota(true);
+  h.elements.get('#ok').onclick();
+  assert.equal(h.elements.get('#sheet').open,true);
+});
+
+test('stale decision whose status response was lost can leave the queue on retry', async () => {
+  const h=harness();proposal(h);h.put(chapter.file,'Новый текст автора.');let fail=true;
+  h.hook(({path,method,options,put})=>{if(path===proposalsPath&&method==='PUT'&&fail){fail=false;put(path,Buffer.from(JSON.parse(options.body).content,'base64').toString());throw Error('response lost');}});
+  await assert.rejects(h.run('pushQueue()'));
+  await h.run('pushQueue()');
+  assert.equal(h.run('queue.length'),0);assert.equal(h.files.get(chapter.file).text,'Новый текст автора.');
+});
+
+test('confirmed accepted decision does not try to overwrite later author changes on retry', async () => {
+  const h=harness();proposal(h);let fail=true;
+  h.hook(({path,method,options,put})=>{if(path===proposalsPath&&method==='PUT'&&fail){fail=false;put(path,Buffer.from(JSON.parse(options.body).content,'base64').toString());throw Error('response lost');}});
+  await assert.rejects(h.run('pushQueue()'));h.put(chapter.file,'Правка автора после принятия.');
+  await h.run('pushQueue()');assert.equal(h.run('queue.length'),0);
+  assert.equal(h.files.get(chapter.file).text,'Правка автора после принятия.');
+});
+
+test('unchecked proposal parts survive reloading the editor', () => {
+  const h=harness();h.run('selectPart("p1",2,false)');
+  const reopened=harness(h.storage);
+  assert.equal(reopened.run('skipOf("p1").has(2)'),true);
+});
+
+test('a new remark arriving during review unchecks its part; explicit recheck is respected', () => {
+  const h=harness();
+  h.put(chapter.file,'А\n\nБ\n\nВ\n\nГ');h.put('p.md','А\n\nБ2\n\nВ\n\nГ2');
+  h.put(proposalsPath,JSON.stringify({proposals:[{id:'pp',chapter:'gpt17',base:h.files.get(chapter.file).sha,status:'pending',file:'p.md'}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';route={screen:"chapter",chapter:"gpt17",tab:"proposals",proposal:"pp"};renderProposals(chapterById("gpt17"))');
+  h.put(notesPath,JSON.stringify({notes:[{id:'n-arrived',status:'open',comment:'Не принимать это место',proposal:'pp',part:2,replies:[]}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';renderProposals(chapterById("gpt17"))');
+  assert.equal(h.run('skipOf("pp").has(2)'),true);
+  h.run('selectPart("pp",2,true);renderProposals(chapterById("gpt17"))');
+  assert.equal(h.run('skipOf("pp").has(2)'),false);
+});
+
+test('service worker update leaves an active note dialog and typed text intact', () => {
+  const h=harness();let reloads=0;h.ctx.location={reload(){reloads++}};
+  h.run('route={screen:"chapter",tab:"notes",chapter:"gpt17"};$("#sheet").open=true;$("#noteText").value="Ещё не сохранённая заметка";requestAppUpdate()');
+  assert.equal(reloads,0);assert.equal(h.elements.get('#noteText').value,'Ещё не сохранённая заметка');
+  assert.equal(h.elements.get('#sheet').open,true);assert.match(h.elements.get('#banner').innerHTML,/Готово обновление/);
+  h.run('applyAppUpdate()');assert.equal(reloads,0);
+});
+
+test('service worker update does not restart a proposal review', () => {
+  const h=harness();let reloads=0;h.ctx.location={reload(){reloads++}};
+  h.run('route={screen:"chapter",tab:"proposals",chapter:"gpt17"};requestAppUpdate()');assert.equal(reloads,0);
+  h.run('applyAppUpdate()');assert.equal(reloads,1);
+});
+
+test('service worker may update automatically on the idle home screen', () => {
+  const h=harness();let reloads=0;h.ctx.location={reload(){reloads++}};
+  h.run('requestAppUpdate()');assert.equal(reloads,1);
+});
+
+test('a waiting update stays inactive until the active form is saved', () => {
+  const h=harness();let activations=0,reloads=0;h.ctx.location={reload(){reloads++}};
+  h.ctx.qaWorker={postMessage(message){assert.equal(message.type,'ACTIVATE_UPDATE');activations++}};
+  h.run('route={screen:"chapter",tab:"notes",chapter:"gpt17"};$("#sheet").open=true;requestAppUpdate(qaWorker)');
+  assert.equal(activations,0);assert.equal(reloads,0);
+  h.run('$("#sheet").open=false;applyAppUpdate()');assert.equal(activations,1);assert.equal(reloads,0);
+});
+
+test('old queued operation without operation id is not mistaken for a completed decision', async () => {
+  const h=harness();proposal(h);h.run('delete queue[0].operationId');await h.run('pushQueue()');
+  assert.equal(h.files.get(chapter.file).text,'Предложение');assert.equal(h.run('queue.length'),0);
+});
+
+test('author wording is preserved separately when proposal acceptance becomes stale', async () => {
+  const h=harness();proposal(h);h.run('queue[0].text="Свой вариант автора";queue[0].edited=[1];queue[0].parts=[1];queue[0].total=1');
+  h.put(chapter.file,'Новый независимый текст');await h.run('pushQueue()');
+  assert.equal(h.files.get(chapter.file).text,'Новый независимый текст');
+  const saved=[...h.files].find(([p])=>p.includes('конфликты'));
+  assert.ok(saved,'custom author wording must survive stale acceptance');
+  assert.equal(saved[1].text,'Свой вариант автора');
+});
+
+test('slow history request cannot overwrite a chapter opened later', async () => {
+  const h=harness();let release;
+  h.hook(({path,method})=>!path&&method==='GET'?new Promise(resolve=>{release=()=>resolve({ok:true,status:200,json:async()=>[{sha:'v1',commit:{message:'Тестовая версия',author:{date:'2026-10-22T00:00:00Z'}}}]})}):null);
+  const history=h.run('route={screen:"chapter",tab:"history",chapter:"gpt17"};renderHistory(chapterById("gpt17"))');
+  h.run('route={screen:"chapter",tab:"read",chapter:"ch03"};renderRead(chapterById("ch03"))');
+  const expected=h.elements.get('#view').innerHTML;release();await history;
+  assert.equal(h.elements.get('#view').innerHTML,expected);
+});
+
+test('accepted proposal can be fetched after synchronization removed its cached file', async () => {
+  const h=harness();h.put('p.md','Полный исходный вариант агента');
+  const p={id:'accepted',chapter:'gpt17',file:'p.md',status:'accepted',acceptedParts:[1],partsTotal:2};
+  h.put(proposalsPath,JSON.stringify({proposals:[p]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';delete data.files["p.md"];route={screen:"chapter",tab:"proposals",chapter:"gpt17",proposal:"accepted",clean:true}');
+  await h.run('loadProposal(chapterById("gpt17"),proposalsOf("gpt17")[0])');
+  assert.equal(h.run('data.files["p.md"].text'),'Полный исходный вариант агента');
+  const html=h.elements.get('#view').innerHTML;
+  assert.match(html,/Это исходный текст предложения агента/);assert.match(html,/Текст предложения/);
+  assert.match(html,/принято частично: 1 из 2/);
 });

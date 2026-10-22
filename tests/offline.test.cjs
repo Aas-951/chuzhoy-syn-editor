@@ -7,12 +7,12 @@ const path = require('node:path');
 function worker() {
   const current = fs.readFileSync(path.join(__dirname, '../sw.js'), 'utf8').match(/CACHE = '([^']+)'/)[1];
   const handlers = {}, entries = new Map(), deleted = [], names = ['unrelated-cache', 'chuzhoy-syn-editor-v1', current];
-  let online = true;
+  let online = true, activations = 0;
   const response = text => ({ ok: true, text, clone() { return response(text); } });
   const root = 'https://example.test/chuzhoy-syn-editor/';
   const key = req => new URL(typeof req === 'string' ? req : req.url, root).pathname;
   const cache = { async addAll(files) { for (const file of files) entries.set(key(file), response('cached ' + file)); }, async match(req) { return entries.get(key(req)); }, async put(req, value) { entries.set(key(req), value); } };
-  const ctx = vm.createContext({ URL, setTimeout: (f, ms) => setTimeout(f, ms).unref(), location: { origin: 'https://example.test' }, self: { registration: { scope: root }, clients: { claim: async () => {} }, skipWaiting: async () => {}, addEventListener(name, handler) { handlers[name] = handler; } },
+  const ctx = vm.createContext({ URL, setTimeout: (f, ms) => setTimeout(f, ms).unref(), location: { origin: 'https://example.test' }, self: { registration: { scope: root }, clients: { claim: async () => {} }, skipWaiting: async () => { activations++; }, addEventListener(name, handler) { handlers[name] = handler; } },
     caches: { open: async () => cache, keys: async () => names, delete: async name => { deleted.push(name); } },
     fetch: async () => { if (!online) throw Error('offline'); return response('fresh'); },
   });
@@ -22,7 +22,7 @@ function worker() {
     const e = { request: { url, method }, waitUntil(p) { waits.push(p); }, respondWith(p) { answer = p; } };
     handlers.fetch(e); return { answer, waits };
   };
-  return { handlers, entries, deleted, event, offline() { online = false; }, root };
+  return { handlers, entries, deleted, event, offline() { online = false; }, root, activations: () => activations };
 }
 
 test('installed app shell reopens without internet', async () => {
@@ -52,4 +52,11 @@ test('online the fresh app is served first, and the shown version matches the ca
   assert.equal((await w.event(w.root+'app.js').answer).text,'fresh');
   const sw=fs.readFileSync(path.join(__dirname,'../sw.js'),'utf8'),app=fs.readFileSync(path.join(__dirname,'../app.js'),'utf8');
   assert.equal(app.match(/APP_VERSION = (\d+)/)[1],sw.match(/editor-v(\d+)/)[1]);
+});
+
+test('installing the update does not force a reload of the old editor', async () => {
+  const w=worker();let install;w.handlers.install({waitUntil(p){install=p;}});await install;
+  assert.equal(w.activations(),0);
+  let activate;w.handlers.message({data:{type:'ACTIVATE_UPDATE'},waitUntil(p){activate=p;}});await activate;
+  assert.equal(w.activations(),1);
 });

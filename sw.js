@@ -1,10 +1,16 @@
 // Кэширует только сам редактор (без текста романа), чтобы он открывался без сети.
 // Главы и заметки хранятся в памяти браузера телефона, а не здесь.
-const CACHE = 'chuzhoy-syn-editor-v10';
+const CACHE = 'chuzhoy-syn-editor-v11';
 const SHELL = ['./', 'index.html', 'app.js', 'style.css', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // Existing version 10 reloads immediately on controllerchange. Let the new
+  // page activate this worker at a safe moment; never interrupt an old form.
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
+});
+
+self.addEventListener('message', e => {
+  if (e.data?.type === 'ACTIVATE_UPDATE') e.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener('activate', e => {
