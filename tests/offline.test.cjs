@@ -12,7 +12,7 @@ function worker() {
   const root = 'https://example.test/chuzhoy-syn-editor/';
   const key = req => new URL(typeof req === 'string' ? req : req.url, root).pathname;
   const cache = { async addAll(files) { for (const file of files) entries.set(key(file), response('cached ' + file)); }, async match(req) { return entries.get(key(req)); }, async put(req, value) { entries.set(key(req), value); } };
-  const ctx = vm.createContext({ URL, location: { origin: 'https://example.test' }, self: { registration: { scope: root }, clients: { claim: async () => {} }, skipWaiting: async () => {}, addEventListener(name, handler) { handlers[name] = handler; } },
+  const ctx = vm.createContext({ URL, setTimeout: (f, ms) => setTimeout(f, ms).unref(), location: { origin: 'https://example.test' }, self: { registration: { scope: root }, clients: { claim: async () => {} }, skipWaiting: async () => {}, addEventListener(name, handler) { handlers[name] = handler; } },
     caches: { open: async () => cache, keys: async () => names, delete: async name => { deleted.push(name); } },
     fetch: async () => { if (!online) throw Error('offline'); return response('fresh'); },
   });
@@ -45,4 +45,11 @@ test('upgrade removes only editor-owned obsolete shell caches', async () => {
 test('refresh remains part of service worker event lifetime', async () => {
   const w=worker();const e=w.event(w.root+'app.js');assert.equal(e.waits.length,1);await Promise.all(e.waits);
   assert.equal((await e.answer).text,'fresh');
+});
+
+test('online the fresh app is served first, and the shown version matches the cache name', async () => {
+  const w=worker();let install;w.handlers.install({waitUntil(p){install=p;}});await install;
+  assert.equal((await w.event(w.root+'app.js').answer).text,'fresh');
+  const sw=fs.readFileSync(path.join(__dirname,'../sw.js'),'utf8'),app=fs.readFileSync(path.join(__dirname,'../app.js'),'utf8');
+  assert.equal(app.match(/APP_VERSION = (\d+)/)[1],sw.match(/editor-v(\d+)/)[1]);
 });

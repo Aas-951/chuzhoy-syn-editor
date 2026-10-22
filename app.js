@@ -19,6 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
+const APP_VERSION = 10; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -944,6 +945,7 @@ function renderSettings() {
   $('#tabs').hidden = true; $('#back').hidden = !cfg.token;
   const v = $('#view');
   v.innerHTML = `<div class="form">
+    <p class="hint">Версия редактора: ${APP_VERSION}</p>
     <p>Редактор хранит главы на телефоне и синхронизирует их с вашим закрытым репозиторием GitHub. Для этого нужен ключ доступа — один раз.</p>
     <ol class="steps">
       <li>Откройте <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com → новый ключ</a> (войдите в аккаунт).</li>
@@ -1018,7 +1020,12 @@ addEventListener('online', () => sync());
 addEventListener('offline', renderStatus);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); });
 setInterval(() => { if (document.visibilityState === 'visible') sync(); }, 5 * 60 * 1000);
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator) {
+  // Когда приходит новая версия редактора, страница перезагружается сама (черновики хранятся в памяти телефона).
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController) location.reload(); });
+  navigator.serviceWorker.register('sw.js').then(reg => document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); })).catch(() => {});
+}
 if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
 
 render();
