@@ -47,6 +47,66 @@ function harness(savedStorage = []) {
   return { run, files, storage, elements, put, ctx, hook: f => { onRequest = f; }, quota: value => { failStorage = value; }, calls: () => calls };
 }
 
+test('quote relocation uses both contexts across paragraphs and refuses ambiguous matches', () => {
+  const h = harness();
+  h.ctx.blocks = ['Первый берег далеко.', 'Другой берег близко.'];
+  assert.equal(h.run('locateQuote(blocks,{quote:"берег"})'), null);
+  assert.equal(h.run('locateQuote(blocks,{quote:"берег",prefix:"Другой",suffix:"близко."}).block'), 1);
+  assert.equal(h.run('locateQuote(blocks,{quote:"исчезло"})'), null);
+  assert.equal(h.run('locateQuote(["Один берег."],{quote:"берег",prefix:"старое"}).start'), 5);
+});
+
+test('normalized quotation preserves DOM offsets around repeated spaces and Unicode', () => {
+  const h = harness();
+  h.ctx.qaText = '  Айгүл:  тихая\n  вода 🌊.';
+  const at = h.run('locateQuote([qaText],{quote:"тихая вода 🌊"})');
+  assert.equal(h.ctx.qaText.slice(at.start, at.end), 'тихая\n  вода 🌊');
+});
+
+test('unfinished note survives restart with its quotation and original chapter SHA', () => {
+  const h = harness(); h.ctx.getSelection = () => ({ removeAllRanges() {} });
+  const base = h.files.get(chapter.file).sha;
+  h.run('noteSheet(chapterById("gpt17"),{quote:"Исходный",prefix:"",suffix:"текст"});$("#noteText").value="Мой вопрос";$("#noteText").oninput();$("#cancel").onclick()');
+  const recovered = harness([...h.storage]); recovered.ctx.getSelection = () => ({ removeAllRanges() {} });
+  recovered.run('data.files["codex/главы/17.md"]={sha:"new-agent-sha",text:"Свежая глава"};noteSheet(chapterById("gpt17"),{quote:"Другая цитата"})');
+  assert.equal(recovered.elements.get('#noteText').value, 'Мой вопрос');
+  assert.match(recovered.elements.get('#sheet').innerHTML, /Восстановлена/);
+  recovered.run('$("#ok").onclick()');
+  assert.equal(recovered.run('queue[0].note.chapterSha'), base);
+  assert.equal(recovered.run('queue[0].note.quote'), 'Исходный');
+  assert.equal(recovered.run('queue[0].note.suffix'), 'текст');
+  assert.equal(recovered.storage.has('cs.noteDraft.gpt17'), false);
+});
+
+test('note save failure keeps the dialog and recovery draft; other edition has its own draft', () => {
+  const h = harness();
+  h.run('noteSheet(chapterById("gpt17"),{quote:"цитата"});$("#noteText").value="Не потерять";$("#noteText").oninput()');
+  h.quota(true); h.run('$("#ok").onclick()');
+  assert.equal(h.elements.get('#sheet').open, true);
+  assert.equal(h.run('queue.length'), 0);
+  assert.equal(JSON.parse(h.storage.get('cs.noteDraft.gpt17')).comment, 'Не потерять');
+  h.quota(false); h.run('$("#cancel").onclick();noteSheet(chapterById("ch03"),{quote:"Ваал"})');
+  assert.equal(h.elements.get('#noteText').value, '');
+  assert.equal(h.run('loadNoteDraft("gpt17").comment'), 'Не потерять');
+});
+
+test('proposal notes are not highlighted as notes of the current chapter', () => {
+  const h = harness();
+  h.put(notesPath,JSON.stringify({notes:[{id:'live',status:'open',quote:'текст'},{id:'p',status:'open',quote:'текст',proposal:'pp',part:1}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files)));
+  assert.equal(h.run('liveNotes(chapterById("gpt17")).length'), 1);
+});
+
+test('manual update check reports offline and activates an available worker', async () => {
+  const h = harness(); h.run('navigator.onLine=false'); await h.run('checkAppUpdate()');
+  assert.match(h.elements.get('#banner').innerHTML, /нужен Интернет/);
+  let updates=0, activations=0;
+  h.ctx.navigator.serviceWorker={getRegistration:async()=>({update:async()=>updates++,waiting:{postMessage(){activations++;}}})};
+  h.run('navigator.onLine=true'); await h.run('checkAppUpdate()');
+  assert.equal(updates,1); assert.equal(activations,1);
+  h.run('renderChapters()'); assert.match(h.elements.get('#view').innerHTML,new RegExp('Редактор · версия ' + h.run('APP_VERSION')));
+});
+
 test('offline edit survives in persisted queue; no network attempted', async () => {
   const h = harness(); h.run('navigator.onLine = false; enqueue({type:"edit",chapter:"gpt17",base:data.files["codex/главы/17.md"].sha,text:"Моя правка"})');
   await h.run('sync()'); assert.equal(h.calls(), 0);

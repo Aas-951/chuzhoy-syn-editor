@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 11; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 12; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -336,6 +336,21 @@ function applyAppUpdate() {
   }
   location.reload();
 }
+async function checkAppUpdate() {
+  if (!navigator.onLine) { notice = 'Для проверки обновления нужен Интернет.'; return renderBanner(); }
+  try {
+    if (!navigator.serviceWorker) throw Error('Обновите страницу в браузере.');
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (!reg) throw Error('Закройте редактор и откройте его снова через браузер.');
+    await reg.update();
+    if (reg.waiting) return requestAppUpdate(reg.waiting);
+    notice = reg.installing ? 'Обновление загружается. Дождитесь кнопки «Обновить».' : `Проверка завершена. Открыта версия ${APP_VERSION}.`;
+  } catch (e) { notice = esc(e.message || 'Не удалось проверить обновление.'); }
+  renderBanner();
+}
+function appInfoHtml() {
+  return `<div class="app-info"><span>Редактор · версия ${APP_VERSION}</span><button class="btn" data-check-update>Проверить обновление</button></div>`;
+}
 function go(r, msg = '') { notice = msg; route = { ...route, ...r }; window.scrollTo(0, 0); render(); }
 
 function renderBanner() {
@@ -379,13 +394,14 @@ function renderChapters() {
   const list = chapters().filter(ch => editionOf(ch) === edition);
   const v = $('#view');
   if (!list.length) {
-    v.innerHTML = `<div class="empty">${data.syncedAt ? 'В репозитории нет файла редактор/главы.json.' : 'Главы ещё не загружены. Нужен Интернет для первой загрузки.'}</div>
+    v.innerHTML = `${appInfoHtml()}<div class="empty">${data.syncedAt ? 'В репозитории нет файла редактор/главы.json.' : 'Главы ещё не загружены. Нужен Интернет для первой загрузки.'}</div>
       <div class="row end"><button class="btn" id="toSettings">Настройки</button></div>`;
     $('#toSettings').onclick = () => go({ screen: 'settings' });
+    v.querySelectorAll('[data-check-update]').forEach(b => b.onclick = checkAppUpdate);
     return;
   }
   const todo = inbox();
-  v.innerHTML = `${inboxHtml(todo)}
+  v.innerHTML = `${appInfoHtml()}${inboxHtml(todo)}
   <div class="editions" aria-label="Редакция романа">${editions().map(e => {
     const n = todo.filter(it => editionOf(it.ch) === e.id).length;
     return `<button class="btn ${e.id === edition ? 'primary' : ''}" data-edition="${esc(e.id)}" aria-pressed="${e.id === edition}">${esc(e.title)} <span class="count">${n || ''}</span></button>`;
@@ -409,6 +425,7 @@ function renderChapters() {
   v.querySelectorAll('[data-edition]').forEach(b => b.onclick = () => { ui.edition = b.dataset.edition; save(KEY.ui, ui); go({ screen: 'chapters', chapter: null }); });
   v.querySelectorAll('[data-inbox]').forEach(b => b.onclick = () => openInboxItem(todo[+b.dataset.inbox]));
   $('#toSettings').onclick = () => go({ screen: 'settings' });
+  v.querySelectorAll('[data-check-update]').forEach(b => b.onclick = checkAppUpdate);
 }
 
 // Что ждёт автора: предложения и ответы агентов во всех редакциях.
@@ -467,44 +484,106 @@ function renderRead(ch) {
   v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button></div>
     ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
     ${waiting ? `<div class="row"><span class="hint grow">Это текст до правок. Есть предложение от ${esc(waiting.by || 'агента')}.</span><button class="btn" id="readNew">Читать с правками</button></div>` : ''}
+    <p class="hint">Кнопка ＋ возле абзаца — новая заметка. Номер — открыть заметку. Можно выделить отдельные слова.</p>
+    ${loadNoteDraft(ch.id) ? '<button class="btn" id="resumeNote">Продолжить недописанную заметку</button>' : ''}
     <article class="article" id="article">${mdToHtml(text)}</article>`;
   readSize();
   if (waiting) $('#readNew').onclick = () => go({ tab: 'proposals', proposal: waiting.id, clean: true });
+  annotateRead(ch);
+  if (loadNoteDraft(ch.id)) $('#resumeNote').onclick = () => noteSheet(ch, {});
   highlightNotes(ch);
   if (route.scrollTo) { const id = route.scrollTo; route.scrollTo = null; scrollToNote(ch, id); }
 }
 
 const norm = s => s.replace(/\s+/g, ' ').trim();
-function findRange(root, quote, prefix) {
-  const q = norm(quote); if (!q) return null;
-  for (const el of root.querySelectorAll('p, h1, h2, h3')) {
+// Map normalized whitespace back to original DOM offsets. Never choose the first
+// occurrence of an ambiguous quote, including legacy notes with little context.
+function normalizedText(text) {
+  let flat = ''; const offsets = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = /\s/.test(text[i]) ? ' ' : text[i];
+    if (c === ' ' && (!flat || flat.endsWith(' '))) continue;
+    offsets.push(i); flat += c;
+  }
+  if (flat.endsWith(' ')) { flat = flat.slice(0, -1); offsets.pop(); }
+  return { flat, offsets };
+}
+function locateQuote(blocks, note) {
+  const q = norm(note.quote || ''); if (!q) return null;
+  const candidates = [];
+  blocks.forEach((text, block) => {
+    const { flat, offsets } = normalizedText(text);
+    for (let at = flat.indexOf(q); at >= 0; at = flat.indexOf(q, at + 1)) {
+      const before = flat.slice(0, at), after = flat.slice(at + q.length);
+      const matches = (!note.prefix || before.trimEnd().endsWith(norm(note.prefix))) &&
+        (!note.suffix || after.trimStart().startsWith(norm(note.suffix)));
+      candidates.push({ block, start: offsets[at], end: offsets[at + q.length - 1] + 1, matches });
+    }
+  });
+  const exact = candidates.filter(c => c.matches);
+  return exact.length === 1 ? exact[0] : candidates.length === 1 ? candidates[0] : null;
+}
+function rangeForNote(root, note) {
+  const blocks = [...root.querySelectorAll('p, h1, h2, h3')];
+  const match = locateQuote(blocks.map(el => el.textContent), note);
+  if (!match) return null;
+  const el = blocks[match.block];
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
     const nodes = []; let full = '';
     while (walker.nextNode()) { nodes.push({ node: walker.currentNode, start: full.length }); full += walker.currentNode.data; }
-    const flat = full.replace(/\s/g, ' ');
-    let idx = -1, from = 0;
-    while ((from = flat.indexOf(q, from)) !== -1) {
-      if (!prefix || norm(flat.slice(Math.max(0, from - 60), from)).endsWith(norm(prefix).slice(-20))) { idx = from; break; }
-      if (idx === -1) idx = from; from++;
-    }
-    if (idx === -1) continue;
     const at = pos => { const n = nodes.findLast(n => n.start <= pos) || nodes[0]; return [n.node, Math.min(pos - n.start, n.node.data.length)]; };
     const r = document.createRange();
-    r.setStart(...at(idx)); r.setEnd(...at(idx + q.length));
+    r.setStart(...at(match.start)); r.setEnd(...at(match.end));
     return r;
+}
+function findRange(root, quote, prefix, suffix = '') { return rangeForNote(root, { quote, prefix, suffix }); }
+const liveNotes = ch => openNotes(ch.id).filter(n => !n.proposal);
+function annotateRead(ch) {
+  const art = $('#article'); if (!art) return;
+  const blocks = [...art.querySelectorAll('p, h1, h2, h3')];
+  const texts = blocks.map(el => el.textContent);
+  const notes = liveNotes(ch).filter(n => norm(n.quote || ''));
+  const located = notes.map(note => ({ note, at: locateQuote(texts, note) }));
+  blocks.forEach((el, i) => {
+    if (el.tagName !== 'P') return;
+    const row = document.createElement('div'); row.className = 'read-row';
+    el.before(row); row.append(el);
+    const actions = document.createElement('div'); actions.className = 'read-actions';
+    const add = document.createElement('button'); add.className = 'para-add'; add.textContent = '＋';
+    add.setAttribute('aria-label', 'Добавить заметку к абзацу');
+    add.onclick = () => noteSheet(ch, { quote: texts[i], prefix: '', suffix: '' }); actions.append(add);
+    located.forEach(({ note, at }, n) => {
+      if (!at || at.block !== i) return;
+      const b = document.createElement('button'); b.className = 'note-marker'; b.textContent = String(n + 1);
+      b.setAttribute('aria-label', 'Открыть заметку ' + (n + 1)); b.onclick = () => readNoteSheet(ch, note); actions.append(b);
+    });
+    row.append(actions);
+  });
+  const detached = located.filter(n => !n.at).length;
+  if (detached) {
+    const warning = document.createElement('p'); warning.className = 'hint';
+    warning.textContent = `Не удалось однозначно найти цитату у заметок: ${detached}. Они сохранены во вкладке «Заметки».`;
+    art.before(warning);
   }
-  return null;
+}
+function readNoteSheet(ch, note) {
+  const d = $('#sheet');
+  d.innerHTML = `<h3>${WHO[note.type] || 'Заметка'}</h3><div class="q">${esc(note.quote || '')}</div><div class="c">${esc(note.comment)}</div>
+    ${(note.replies || []).map(r => `<div class="reply"><span class="who">${esc(r.by)}</span><div>${esc(r.text)}</div></div>`).join('')}
+    <div class="row end mt"><button class="btn" id="noteClose">Закрыть окно</button><button class="btn" id="noteReply">Ответить</button></div>`;
+  d.showModal(); $('#noteClose').onclick = () => d.close();
+  $('#noteReply').onclick = () => { d.close(); replySheet(ch, note.id); };
 }
 function highlightNotes(ch) {
   if (!window.CSS?.highlights || typeof Highlight === 'undefined') return;
   const art = $('#article'); if (!art) return;
-  const ranges = openNotes(ch.id).map(n => findRange(art, n.quote, n.prefix)).filter(Boolean);
+  const ranges = liveNotes(ch).map(n => findRange(art, n.quote, n.prefix, n.suffix)).filter(Boolean);
   CSS.highlights.set('note', new Highlight(...ranges));
 }
 function scrollToNote(ch, id) {
   const n = notesOf(ch.id).find(n => n.id === id); const art = $('#article');
-  const r = n && art && findRange(art, n.quote, n.prefix);
-  if (!r) return;
+  const r = n && !n.proposal && art && findRange(art, n.quote, n.prefix, n.suffix);
+  if (!r) { notice = 'Цитата не найдена однозначно в текущей главе. Откройте заметку во вкладке «Заметки».'; renderBanner(); return; }
   const el = r.startContainer.parentElement.closest('p, h1, h2, h3');
   el.scrollIntoView({ block: 'center' }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1700);
 }
@@ -519,16 +598,28 @@ document.addEventListener('selectionchange', () => {
   if (!quote || !art || !art.contains(sel.getRangeAt(0).commonAncestorContainer)) { fab.hidden = true; return; }
   const r = sel.getRangeAt(0);
   const block = r.startContainer.parentElement?.closest('p, h1, h2, h3');
-  let prefix = '';
-  if (block) { const pre = document.createRange(); pre.selectNodeContents(block); pre.setEnd(r.startContainer, r.startOffset); prefix = norm(pre.toString()).slice(-40); }
-  selectionInfo = { quote, prefix };
+  if (!block || !block.contains(r.endContainer)) { fab.hidden = true; return; }
+  const pre = document.createRange(); pre.selectNodeContents(block); pre.setEnd(r.startContainer, r.startOffset);
+  const post = document.createRange(); post.selectNodeContents(block); post.setStart(r.endContainer, r.endOffset);
+  selectionInfo = { quote, prefix: norm(pre.toString()).slice(-60), suffix: norm(post.toString()).slice(0, 60) };
   fab.hidden = false;
 });
 $('#addNote').onclick = () => { if (selectionInfo) noteSheet(chapterById(route.chapter), selectionInfo); };
 
-function noteSheet(ch, { quote, prefix }) {
+const noteDraftKey = id => 'cs.noteDraft.' + id;
+function loadNoteDraft(id) {
+  const draft = load(noteDraftKey(id), null);
+  return draft && typeof draft.comment === 'string' && typeof draft.quote === 'string' ? draft : null;
+}
+function noteSheet(ch, anchor) {
+  const recovered = loadNoteDraft(ch.id);
+  const f = data.files[ch.file];
+  const draft = recovered || { quote: anchor.quote || '', prefix: anchor.prefix || '', suffix: anchor.suffix || '',
+    chapterSha: pendingEdit(ch.id) || pendingAccept(ch.id) ? null : f?.sha || null, type: 'remark', comment: '' };
+  const { quote, prefix, suffix } = draft;
   const d = $('#sheet');
   d.innerHTML = `<h3>Новая заметка</h3>
+    ${recovered ? '<p class="hint">Восстановлена недописанная заметка. Новая цитата её не заменяет.</p>' : ''}
     ${quote ? `<div class="q">${esc(quote)}</div>` : '<p class="hint">Заметка ко всей главе.</p>'}
     <div class="seg">
       <label><input type="radio" name="type" value="remark" checked>Замечание</label>
@@ -536,18 +627,33 @@ function noteSheet(ch, { quote, prefix }) {
     </div>
     <textarea id="noteText" placeholder="Что не так или что спросить…"></textarea>
     <p class="hint">Замечание — что поправить. Вопрос — агент ответит прямо в заметке.</p>
-    <div class="row end"><button class="btn" id="cancel">Отмена</button><button class="btn primary" id="ok">Сохранить</button></div>`;
+    <p class="hint" id="draftState">Недописанная заметка остаётся на этом телефоне.</p>
+    <div class="row end"><button class="btn danger" id="discardNote">Удалить черновик</button><button class="btn" id="cancel">Позже</button><button class="btn primary" id="ok">Сохранить</button></div>`;
+  $('#noteText').value = draft.comment;
+  d.querySelector(`input[value="${draft.type === 'question' ? 'question' : 'remark'}"]`).checked = true;
+  const keep = () => {
+    draft.comment = $('#noteText').value;
+    draft.type = d.querySelector('input[name=type]:checked').value;
+    return save(noteDraftKey(ch.id), draft);
+  };
+  $('#noteText').oninput = keep;
+  d.querySelectorAll('input[name=type]').forEach(b => b.onchange = keep);
+  $('#draftState').textContent = 'Недописанная заметка остаётся на этом телефоне; агент увидит её после нажатия «Сохранить» и синхронизации.';
   d.showModal();
-  $('#cancel').onclick = () => d.close();
+  $('#cancel').onclick = () => { if (keep()) { d.close(); render(); } };
+  $('#discardNote').onclick = () => {
+    if (!confirm('Удалить недописанную заметку с этого телефона?')) return;
+    localStorage.removeItem(noteDraftKey(ch.id)); d.close(); render();
+  };
   $('#ok').onclick = () => {
     const comment = $('#noteText').value.trim(); if (!comment) return $('#noteText').focus();
-    const f = data.files[ch.file];
     if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
       id: uid('n'), type: d.querySelector('input[name=type]:checked').value, status: 'open',
-      quote, prefix, comment, author: 'автор', createdAt: new Date().toISOString(),
-      chapterSha: pendingEdit(ch.id) ? null : f?.sha || null, replies: [],
+      quote, prefix, suffix, comment, author: 'автор', createdAt: new Date().toISOString(),
+      chapterSha: draft.chapterSha, replies: [],
     } })) return;
-    d.close(); getSelection().removeAllRanges(); $('#addNote').hidden = true;
+    localStorage.removeItem(noteDraftKey(ch.id));
+    d.close(); getSelection().removeAllRanges(); $('#addNote').hidden = true; render();
   };
 }
 
@@ -1048,7 +1154,7 @@ function renderSettings() {
   $('#tabs').hidden = true; $('#back').hidden = !cfg.token;
   const v = $('#view');
   v.innerHTML = `<div class="form">
-    <p class="hint">Версия редактора: ${APP_VERSION}</p>
+    <p class="hint">Версия редактора: ${APP_VERSION}</p>${appInfoHtml()}
     <p>Редактор хранит главы на телефоне и синхронизирует их с вашим закрытым репозиторием GitHub. Для этого нужен ключ доступа — один раз.</p>
     <ol class="steps">
       <li>Откройте <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com → новый ключ</a> (войдите в аккаунт).</li>
@@ -1068,6 +1174,7 @@ function renderSettings() {
     <p id="res"></p>
     <p class="hint">Ключ хранится только на этом телефоне и даёт доступ только к одному репозиторию. Если телефон потеряется — удалите ключ на github.com/settings/personal-access-tokens.</p>
   </div>`;
+  $('#view').querySelectorAll('[data-check-update]').forEach(b => b.onclick = checkAppUpdate);
   $('#check').onclick = async () => {
     cfg = { ...cfg, owner: $('#own').value.trim(), repo: $('#rep').value.trim(), token: $('#tok').value.trim() };
     save(KEY.cfg, cfg);

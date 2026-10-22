@@ -166,3 +166,10 @@ a { color: var(--accent); }
 .paras .para p { margin-bottom: .2em; }
 .pnote { font-family: system-ui, sans-serif; font-size: 14px; margin: 6px 0; padding: 8px 10px; border-radius: 8px; background: var(--card); border: 1px dashed var(--warn); white-space: pre-wrap; text-indent: 0; }
 .pnote .lbl { display: block; color: var(--warn); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.app-info { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin: 0 0 16px; }
+.read-row { display: grid; grid-template-columns: minmax(0, 1fr) 38px; gap: 4px; }
+.read-actions { display: flex; flex-direction: column; align-items: center; gap: 6px; padding-top: 3px; font-family: system-ui, sans-serif; }
+.read-actions button { width: 36px; min-height: 36px; border-radius: 18px; font-size: 16px; padding: 2px; text-indent: 0; }
+.read-actions .para-add { color: var(--muted); border: 1px solid var(--line); }
+.read-actions .note-marker { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
+.sheet .c, .sheet .reply { white-space: pre-wrap; }
