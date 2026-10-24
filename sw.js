@@ -1,6 +1,6 @@
 // Кэширует только сам редактор (без текста романа), чтобы он открывался без сети.
 // Главы и заметки хранятся в памяти браузера телефона, а не здесь.
-const CACHE = 'chuzhoy-syn-editor-v14';
+const CACHE = 'chuzhoy-syn-editor-v15';
 const SHELL = ['./', 'index.html', 'app.js', 'style.css', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {

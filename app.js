@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 14; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 15; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -587,11 +587,11 @@ function readNoteSheet(ch, note) {
   const d = $('#sheet');
   const key = 'cs.noteEdit.' + ch.id + '.' + note.id;
   d.innerHTML = `<h3>Заметка</h3><div class="q">${esc(note.quote || '')}</div>
-    <textarea id="noteEdit"></textarea><p class="hint">Обсуждения — в чате. Изменения отправятся по кнопке «Синхронизировать».</p>
-    <div class="row end"><button class="btn danger" id="noteDelete">Удалить</button><button class="btn" id="noteClose">Закрыть</button><button class="btn primary" id="noteSave">Сохранить</button></div>`;
+    <textarea id="noteEdit" aria-label="Заметка"></textarea>
+    <div class="row end"><button class="btn danger" id="noteDelete">Удалить</button><button class="btn" id="noteClose">Отмена</button><button class="btn primary" id="noteSave">Сохранить</button></div>`;
   $('#noteEdit').value = load(key, note.comment);
   $('#noteEdit').oninput = () => save(key, $('#noteEdit').value);
-  d.showModal(); $('#noteClose').onclick = () => d.close();
+  d.showModal(); $('#noteClose').onclick = () => { localStorage.removeItem(key); d.close(); };
   $('#noteSave').onclick = () => {
     const comment = $('#noteEdit').value.trim(); if (!comment) return;
     if (!enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { comment } })) return;
@@ -649,37 +649,24 @@ function noteSheet(ch, anchor) {
     chapterSha: pendingEdit(ch.id) || pendingAccept(ch.id) ? null : f?.sha || null, type: 'remark', comment: '' };
   const { quote, prefix, suffix } = draft;
   const d = $('#sheet');
-  d.innerHTML = `<h3>Новая заметка</h3>
-    ${recovered ? '<p class="hint">Восстановлена недописанная заметка. Новая цитата её не заменяет.</p>' : ''}
-    ${quote ? `<div class="q">${esc(quote)}</div>` : '<p class="hint">Заметка ко всей главе.</p>'}
-    <div class="seg">
-      <label><input type="radio" name="type" value="remark" checked>Замечание</label>
-      <label><input type="radio" name="type" value="question">Вопрос агенту</label>
-    </div>
-    <textarea id="noteText" placeholder="Что не так или что спросить…"></textarea>
-    <p class="hint">Замечание — что поправить. Вопросы и обсуждения — в чате.</p>
-    <p class="hint" id="draftState">Недописанная заметка остаётся на этом телефоне.</p>
-    <div class="row end"><button class="btn danger" id="discardNote">Удалить черновик</button><button class="btn" id="cancel">Позже</button><button class="btn primary" id="ok">Сохранить</button></div>`;
+  d.innerHTML = `<h3>Заметка</h3>
+    ${quote ? `<div class="q">${esc(quote)}</div>` : ''}
+    <textarea id="noteText" aria-label="Заметка" placeholder="Ваша заметка…"></textarea>
+    <div class="row end"><button class="btn" id="cancel">Отмена</button><button class="btn primary" id="ok">Сохранить</button></div>`;
   $('#noteText').value = draft.comment;
-  d.querySelector(`input[value="${draft.type === 'question' ? 'question' : 'remark'}"]`).checked = true;
   const keep = () => {
     draft.comment = $('#noteText').value;
-    draft.type = d.querySelector('input[name=type]:checked').value;
     return save(noteDraftKey(ch.id), draft);
   };
   $('#noteText').oninput = keep;
-  d.querySelectorAll('input[name=type]').forEach(b => b.onchange = keep);
-  $('#draftState').textContent = 'Недописанная заметка остаётся на этом телефоне; агент увидит её после нажатия «Сохранить» и синхронизации.';
   d.showModal();
-  $('#cancel').onclick = () => { if (keep()) { d.close(); render(); } };
-  $('#discardNote').onclick = () => {
-    if (!confirm('Удалить недописанную заметку с этого телефона?')) return;
+  $('#cancel').onclick = () => {
     localStorage.removeItem(noteDraftKey(ch.id)); d.close(); render();
   };
   $('#ok').onclick = () => {
     const comment = $('#noteText').value.trim(); if (!comment) return $('#noteText').focus();
     if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
-      id: uid('n'), type: d.querySelector('input[name=type]:checked').value, status: 'open',
+      id: uid('n'), type: draft.type || 'remark', status: 'open',
       quote, prefix, suffix, comment, author: 'автор', createdAt: new Date().toISOString(),
       chapterSha: draft.chapterSha, replies: [],
     } })) return;

@@ -100,11 +100,11 @@ test('normalized quotation preserves DOM offsets around repeated spaces and Unic
 test('unfinished note survives restart with its quotation and original chapter SHA', () => {
   const h = harness(); h.ctx.getSelection = () => ({ removeAllRanges() {} });
   const base = h.files.get(chapter.file).sha;
-  h.run('noteSheet(chapterById("gpt17"),{quote:"Исходный",prefix:"",suffix:"текст"});$("#noteText").value="Мой вопрос";$("#noteText").oninput();$("#cancel").onclick()');
+  h.run('noteSheet(chapterById("gpt17"),{quote:"Исходный",prefix:"",suffix:"текст"});$("#noteText").value="Мой вопрос";$("#noteText").oninput()');
   const recovered = harness([...h.storage]); recovered.ctx.getSelection = () => ({ removeAllRanges() {} });
   recovered.run('data.files["codex/главы/17.md"]={sha:"new-agent-sha",text:"Свежая глава"};noteSheet(chapterById("gpt17"),{quote:"Другая цитата"})');
   assert.equal(recovered.elements.get('#noteText').value, 'Мой вопрос');
-  assert.match(recovered.elements.get('#sheet').innerHTML, /Восстановлена/);
+  assert.doesNotMatch(recovered.elements.get('#sheet').innerHTML, /name="type"|draftState|discardNote/);
   recovered.run('$("#ok").onclick()');
   assert.equal(recovered.run('queue[0].note.chapterSha'), base);
   assert.equal(recovered.run('queue[0].note.quote'), 'Исходный');
@@ -119,9 +119,12 @@ test('note save failure keeps the dialog and recovery draft; other edition has i
   assert.equal(h.elements.get('#sheet').open, true);
   assert.equal(h.run('queue.length'), 0);
   assert.equal(JSON.parse(h.storage.get('cs.noteDraft.gpt17')).comment, 'Не потерять');
-  h.quota(false); h.run('$("#cancel").onclick();noteSheet(chapterById("ch03"),{quote:"Ваал"})');
+  h.quota(false); h.run('$("#sheet").close();noteSheet(chapterById("ch03"),{quote:"Ваал"})');
   assert.equal(h.elements.get('#noteText').value, '');
   assert.equal(h.run('loadNoteDraft("gpt17").comment'), 'Не потерять');
+  h.run('noteSheet(chapterById("gpt17"),{});$("#cancel").onclick()');
+  assert.equal(h.run('loadNoteDraft("gpt17")'), null);
+  assert.equal(h.run('queue.length'), 0);
 });
 
 test('proposal notes are not highlighted as notes of the current chapter', () => {
