@@ -53,6 +53,8 @@ test('saving online persists locally without scheduling network work', () => {
   h.run('enqueue({type:"note-add",chapter:"gpt17",note:{id:"local",status:"open",comment:"Draft"}})');
   assert.equal(h.calls(), 0); assert.equal(timers, 0);
   assert.equal(JSON.parse(h.storage.get('cs.queue'))[0].note.id, 'local');
+  h.run('enqueue({type:"note-set",chapter:"gpt17",id:"local",fields:{status:"done",deleted:true}});notesOf("gpt17")');
+  assert.equal(h.run('queue[0].note.status'), 'open');
 });
 
 test('deleting and restoring notes survives reload and sync without losing replies', async () => {

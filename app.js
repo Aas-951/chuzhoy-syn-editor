@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 13; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 14; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -106,7 +106,7 @@ function applyNoteOps(notes, chapterId) {
   const list = JSON.parse(JSON.stringify(notes));
   for (const op of queue) {
     if (op.chapter !== chapterId) continue;
-    if (op.type === 'note-add' && !list.some(n => n.id === op.note.id)) list.push(op.note);
+    if (op.type === 'note-add' && !list.some(n => n.id === op.note.id)) list.push(JSON.parse(JSON.stringify(op.note)));
     if (op.type === 'note-set') { const n = list.find(n => n.id === op.id); if (n) Object.assign(n, op.fields); }
     if (op.type === 'note-reply') { const n = list.find(n => n.id === op.id); if (n) { n.replies = n.replies || []; if (!n.replies.some(r => r.id === op.reply.id)) n.replies.push(op.reply); } }
   }
