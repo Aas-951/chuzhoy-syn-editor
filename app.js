@@ -1,7 +1,7 @@
 'use strict';
 // Редактор «Чужой сын». Без сервера: главы и заметки лежат в закрытом
 // репозитории GitHub, телефон держит копию у себя и отправляет очередь,
-// когда появляется сеть. Формат данных описан в редактор/README.md репозитория.
+// по кнопке «Синхронизировать». Формат данных описан в редактор/README.md репозитория.
 
 const API = 'https://api.github.com';
 const branch = () => cfg.branch || 'main';   // другая ветка — только для проверки редактора
@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 12; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 13; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -110,7 +110,7 @@ function applyNoteOps(notes, chapterId) {
     if (op.type === 'note-set') { const n = list.find(n => n.id === op.id); if (n) Object.assign(n, op.fields); }
     if (op.type === 'note-reply') { const n = list.find(n => n.id === op.id); if (n) { n.replies = n.replies || []; if (!n.replies.some(r => r.id === op.reply.id)) n.replies.push(op.reply); } }
   }
-  return list;
+  return list.filter(n => !n.deleted);
 }
 const serverNotes = id => parseJSON(data.files[notesPath(id)]?.text || '', { notes: [] }).notes || [];
 const notesOf = id => applyNoteOps(serverNotes(id), id);
@@ -126,6 +126,7 @@ function proposalsOf(id) {
 
 // ---------- очередь ----------
 function enqueue(op) {
+  rememberReading();
   const before = queue;
   op.at = new Date().toISOString();
   op.operationId = uid('op');
@@ -134,12 +135,10 @@ function enqueue(op) {
     queue = prev ? queue.map(item => item === prev ? { ...prev, text: op.text, at: op.at, operationId: op.operationId } : item) : [...queue, op];
   } else queue = [...queue, op];
   if (!saveQueue()) { queue = before; return false; }
-  render(); scheduleSync(2500); return true;
+  render(); return true;
 }
 
 // ---------- синхронизация ----------
-let syncTimer = null;
-function scheduleSync(ms) { clearTimeout(syncTimer); syncTimer = setTimeout(sync, ms); }
 
 async function sync() {
   if (syncing || !cfg.token || !navigator.onLine) { renderStatus(); return; }
@@ -157,7 +156,6 @@ async function sync() {
     // Do not replace an editor or a note dialog while the author is typing.
     if (route.tab === 'edit' && route.screen === 'chapter' || $('#sheet').open || route.screen === 'settings') renderStatus();
     else render();
-    if (queue.length && navigator.onLine) scheduleSync(30000);
   }
 }
 
@@ -313,7 +311,8 @@ function renderStatus() {
   if (!cfg.token) { dot.className = 'dot err'; t.textContent = 'Настройки'; return; }
   if (!navigator.onLine) { dot.className = 'dot off'; t.textContent = n ? `Без сети · ждут: ${n}` : 'Без сети'; return; }
   if (syncError) { dot.className = 'dot err'; t.textContent = n ? `Ошибка · ждут: ${n}` : 'Ошибка'; return; }
-  dot.className = 'dot on'; t.textContent = n ? `Ждут: ${n}` : 'Всё отправлено';
+  dot.className = 'dot on'; t.textContent = n ? `Синхронизировать · ${n}` : 'Синхронизировать';
+  $('#sync').title = n ? `На устройстве: ${n} изменений` : data.syncedAt ? 'Всё синхронизировано' : 'Загрузить главы';
 }
 
 let notice = '';
@@ -351,7 +350,21 @@ async function checkAppUpdate() {
 function appInfoHtml() {
   return `<div class="app-info"><span>Редактор · версия ${APP_VERSION}</span><button class="btn" data-check-update>Проверить обновление</button></div>`;
 }
-function go(r, msg = '') { notice = msg; route = { ...route, ...r }; window.scrollTo(0, 0); render(); }
+function rememberReading() {
+  if (route.screen !== 'chapter' || !['read', 'edit'].includes(route.tab) || route.rawEdit) return;
+  const blocks = [...document.querySelectorAll('#article p, #article h1, #article h2, #article h3')];
+  const index = blocks.findIndex(el => el.getBoundingClientRect().bottom > 90);
+  if (index < 0) return;
+  ui.positions = ui.positions || {};
+  ui.positions[route.chapter] = { index, top: blocks[index].getBoundingClientRect().top };
+  ui.lastChapter = route.chapter; save(KEY.ui, ui);
+}
+function restoreReading(ch) {
+  const pos = ui.positions?.[ch.id]; if (!pos) return;
+  const el = document.querySelectorAll('#article p, #article h1, #article h2, #article h3')[pos.index];
+  if (el) window.scrollBy(0, el.getBoundingClientRect().top - pos.top);
+}
+function go(r, msg = '') { rememberReading(); notice = msg; route = { ...route, ...r }; window.scrollTo(0, 0); render(); }
 
 function renderBanner() {
   const msgs = [];
@@ -394,14 +407,14 @@ function renderChapters() {
   const list = chapters().filter(ch => editionOf(ch) === edition);
   const v = $('#view');
   if (!list.length) {
-    v.innerHTML = `${appInfoHtml()}<div class="empty">${data.syncedAt ? 'В репозитории нет файла редактор/главы.json.' : 'Главы ещё не загружены. Нужен Интернет для первой загрузки.'}</div>
+    v.innerHTML = `${appInfoHtml()}<div class="empty">${data.syncedAt ? 'В репозитории нет файла редактор/главы.json.' : 'Нажмите «Синхронизировать», чтобы загрузить главы. Нужен Интернет.'}</div>
       <div class="row end"><button class="btn" id="toSettings">Настройки</button></div>`;
     $('#toSettings').onclick = () => go({ screen: 'settings' });
     v.querySelectorAll('[data-check-update]').forEach(b => b.onclick = checkAppUpdate);
     return;
   }
-  const todo = inbox();
-  v.innerHTML = `${appInfoHtml()}${inboxHtml(todo)}
+  const todo = inbox().filter(it => it.kind === 'proposal');
+  v.innerHTML = `${appInfoHtml()}${chapterById(ui.lastChapter) ? `<button class="item" data-ch="${esc(ui.lastChapter)}"><div class="t">Продолжить чтение</div><div class="s">${esc(chapterById(ui.lastChapter).title)}</div></button>` : ''}${inboxHtml(todo)}
   <div class="editions" aria-label="Редакция романа">${editions().map(e => {
     const n = todo.filter(it => editionOf(it.ch) === e.id).length;
     return `<button class="btn ${e.id === edition ? 'primary' : ''}" data-edition="${esc(e.id)}" aria-pressed="${e.id === edition}">${esc(e.title)} <span class="count">${n || ''}</span></button>`;
@@ -409,7 +422,7 @@ function renderChapters() {
   <div class="list">${list.map(ch => {
     const text = chapterText(ch);
     const on = openNotes(ch.id).length, pr = proposalsOf(ch.id).filter(p => p.status === 'pending').length;
-    const answered = agentAnswered(ch.id).length;
+    const answered = 0;
     const badges = [
       ch.status ? `<span class="badge ${ch.status === 'черновик' ? 'draft' : ''}">${esc(ch.status)}</span>` : '',
       pendingEdit(ch.id) ? '<span class="badge pending">не отправлено</span>' : '',
@@ -442,7 +455,7 @@ function inbox() {
   return items.sort((a, b) => b.at.localeCompare(a.at));
 }
 function inboxHtml(items) {
-  if (!items.length) return '<p class="hint">Новых предложений и ответов агентов нет.</p>';
+  if (!items.length) return '<p class="hint">Новых предложений нет.</p>';
   return `<section class="inbox"><h2>Ждёт вас: ${items.length}</h2><div class="list">${items.map((it, i) => `<button class="item todo" data-inbox="${i}">
       <div class="t">${it.kind === 'proposal' ? `Предложение правок от ${esc(it.p.by || 'агента')}` : `Агент ответил на заметки: ${it.n}`}</div>
       <div class="where">${esc(it.ch.title)} · ${esc(editionTitle(it.ch))}</div>
@@ -477,22 +490,25 @@ function readSize() {
   $('#bigger').onclick = () => { ui.size = Math.min(28, ui.size + 1); save(KEY.ui, ui); set(); };
 }
 function renderRead(ch) {
+  const editing = route.tab === 'edit';
   const text = chapterText(ch);
   const v = $('#view');
   if (text == null) { v.innerHTML = '<div class="empty">Глава ещё не загружена — нужен Интернет.</div>'; return; }
+  ui.lastChapter = ch.id; save(KEY.ui, ui);
   const waiting = proposalsOf(ch.id).filter(p => p.status === 'pending' && data.files[p.file]).sort((a, b) => (b.at || '').localeCompare(a.at || ''))[0];
-  v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button></div>
+  v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button><button id="theme">Тема</button></div>
     ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
     ${waiting ? `<div class="row"><span class="hint grow">Это текст до правок. Есть предложение от ${esc(waiting.by || 'агента')}.</span><button class="btn" id="readNew">Читать с правками</button></div>` : ''}
-    <p class="hint">Кнопка ＋ возле абзаца — новая заметка. Номер — открыть заметку. Можно выделить отдельные слова.</p>
-    ${loadNoteDraft(ch.id) ? '<button class="btn" id="resumeNote">Продолжить недописанную заметку</button>' : ''}
+    ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку. Номер открывает сохранённую заметку.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
+    ${editing && loadNoteDraft(ch.id) ? '<button class="btn" id="resumeNote">Продолжить недописанную заметку</button>' : ''}
     <article class="article" id="article">${mdToHtml(text)}</article>`;
   readSize();
   if (waiting) $('#readNew').onclick = () => go({ tab: 'proposals', proposal: waiting.id, clean: true });
-  annotateRead(ch);
-  if (loadNoteDraft(ch.id)) $('#resumeNote').onclick = () => noteSheet(ch, {});
-  highlightNotes(ch);
-  if (route.scrollTo) { const id = route.scrollTo; route.scrollTo = null; scrollToNote(ch, id); }
+  $('#theme').onclick = () => { ui.theme = ui.theme === 'dark' ? 'light' : 'dark'; save(KEY.ui, ui); document.documentElement.dataset.theme = ui.theme; };
+  if (editing) { annotateRead(ch); $('#rawEdit').onclick = () => go({ rawEdit: true }); }
+  if (editing && loadNoteDraft(ch.id)) $('#resumeNote').onclick = () => noteSheet(ch, {});
+  if (editing) highlightNotes(ch); else window.CSS?.highlights?.delete('note');
+  if (route.scrollTo) { const id = route.scrollTo; route.scrollTo = null; scrollToNote(ch, id); } else restoreReading(ch);
 }
 
 const norm = s => s.replace(/\s+/g, ' ').trim();
@@ -552,6 +568,7 @@ function annotateRead(ch) {
     const add = document.createElement('button'); add.className = 'para-add'; add.textContent = '＋';
     add.setAttribute('aria-label', 'Добавить заметку к абзацу');
     add.onclick = () => noteSheet(ch, { quote: texts[i], prefix: '', suffix: '' }); actions.append(add);
+    el.onclick = () => { if (getSelection().isCollapsed) add.onclick(); };
     located.forEach(({ note, at }, n) => {
       if (!at || at.block !== i) return;
       const b = document.createElement('button'); b.className = 'note-marker'; b.textContent = String(n + 1);
@@ -568,11 +585,25 @@ function annotateRead(ch) {
 }
 function readNoteSheet(ch, note) {
   const d = $('#sheet');
-  d.innerHTML = `<h3>${WHO[note.type] || 'Заметка'}</h3><div class="q">${esc(note.quote || '')}</div><div class="c">${esc(note.comment)}</div>
-    ${(note.replies || []).map(r => `<div class="reply"><span class="who">${esc(r.by)}</span><div>${esc(r.text)}</div></div>`).join('')}
-    <div class="row end mt"><button class="btn" id="noteClose">Закрыть окно</button><button class="btn" id="noteReply">Ответить</button></div>`;
+  const key = 'cs.noteEdit.' + ch.id + '.' + note.id;
+  d.innerHTML = `<h3>Заметка</h3><div class="q">${esc(note.quote || '')}</div>
+    <textarea id="noteEdit"></textarea><p class="hint">Обсуждения — в чате. Изменения отправятся по кнопке «Синхронизировать».</p>
+    <div class="row end"><button class="btn danger" id="noteDelete">Удалить</button><button class="btn" id="noteClose">Закрыть</button><button class="btn primary" id="noteSave">Сохранить</button></div>`;
+  $('#noteEdit').value = load(key, note.comment);
+  $('#noteEdit').oninput = () => save(key, $('#noteEdit').value);
   d.showModal(); $('#noteClose').onclick = () => d.close();
-  $('#noteReply').onclick = () => { d.close(); replySheet(ch, note.id); };
+  $('#noteSave').onclick = () => {
+    const comment = $('#noteEdit').value.trim(); if (!comment) return;
+    if (!enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { comment } })) return;
+    localStorage.removeItem(key); d.close();
+  };
+  $('#noteDelete').onclick = () => {
+    if (!enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { deleted: true, status: 'done' } })) return;
+    localStorage.removeItem(key);
+    d.innerHTML = '<h3>Заметка удалена</h3><div class="row end"><button class="btn" id="undoDelete">Отменить удаление</button><button class="btn" id="doneDelete">Закрыть</button></div>';
+    $('#doneDelete').onclick = () => d.close();
+    $('#undoDelete').onclick = () => { if (enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { deleted: false, status: note.status } })) readNoteSheet(ch, note); };
+  };
 }
 function highlightNotes(ch) {
   if (!window.CSS?.highlights || typeof Highlight === 'undefined') return;
@@ -592,7 +623,7 @@ function scrollToNote(ch, id) {
 let selectionInfo = null;
 document.addEventListener('selectionchange', () => {
   const fab = $('#addNote');
-  if (route.screen !== 'chapter' || route.tab !== 'read') { fab.hidden = true; return; }
+  if (route.screen !== 'chapter' || route.tab !== 'edit') { fab.hidden = true; return; }
   const sel = getSelection(), art = $('#article');
   const quote = sel && sel.rangeCount ? sel.toString().trim() : '';
   if (!quote || !art || !art.contains(sel.getRangeAt(0).commonAncestorContainer)) { fab.hidden = true; return; }
@@ -626,7 +657,7 @@ function noteSheet(ch, anchor) {
       <label><input type="radio" name="type" value="question">Вопрос агенту</label>
     </div>
     <textarea id="noteText" placeholder="Что не так или что спросить…"></textarea>
-    <p class="hint">Замечание — что поправить. Вопрос — агент ответит прямо в заметке.</p>
+    <p class="hint">Замечание — что поправить. Вопросы и обсуждения — в чате.</p>
     <p class="hint" id="draftState">Недописанная заметка остаётся на этом телефоне.</p>
     <div class="row end"><button class="btn danger" id="discardNote">Удалить черновик</button><button class="btn" id="cancel">Позже</button><button class="btn primary" id="ok">Сохранить</button></div>`;
   $('#noteText').value = draft.comment;
@@ -659,6 +690,7 @@ function noteSheet(ch, anchor) {
 
 // --- правка ---
 function renderEdit(ch) {
+  if (!route.rawEdit) return renderRead(ch);
   const v = $('#view');
   const base = chapterText(ch);
   if (base == null) { v.innerHTML = '<div class="empty">Глава ещё не загружена — нужен Интернет.</div>'; return; }
@@ -668,13 +700,12 @@ function renderEdit(ch) {
   const editBase = draft?.base ?? pendingEdit(ch.id)?.base ?? data.files[ch.file]?.sha;
   const text = draft?.text ?? base;
   // По умолчанию — по абзацам; весь текст целиком — по кнопке или если есть несохранённый черновик.
-  if (!route.rawEdit && (draft == null || draft.text === base)) return renderParagraphs(ch, base);
   v.innerHTML = `<div class="row"><button class="btn" id="byPara">‹ По абзацам</button></div>
     ${draft != null && draft.text !== base ? '<p class="hint">Восстановлен несохранённый черновик с этого телефона.</p>' : ''}
     <textarea class="editor" id="ed" spellcheck="true"></textarea>
     <p class="hint" id="wc"></p>
     <div class="row end"><button class="btn danger" id="discard">Отменить правки</button><button class="btn primary" id="saveEd">Сохранить</button></div>
-    <p class="hint">«Сохранить» записывает правку на телефоне и отправляет её в GitHub, как только будет Интернет. Старая версия остаётся во вкладке «Версии».</p>`;
+    <p class="hint">«Сохранить» записывает правку на телефоне. В GitHub она отправится по кнопке «Синхронизировать».</p>`;
   $('#byPara').onclick = () => {
     if ($('#ed').value !== base && !confirm('Выйти из правки всего текста? Несохранённые изменения пропадут.')) return;
     localStorage.removeItem(KEY.draft(ch.id)); go({ rawEdit: false });
@@ -769,8 +800,8 @@ function renderNotes(ch) {
       <span class="grow"></span><button class="btn" id="noteAll">＋ К главе</button>
     </div>
     <div class="row"><button class="btn" id="taskGPT">Задание для GPT</button><button class="btn" id="taskClaude">Задание для Claude</button></div>
-    <p class="hint">Скопируйте задание в чат T3. Сначала дождитесь отправки заметок. Для ответа агента нужен Интернет.</p>
-    ${shown.length ? '' : '<div class="empty">Заметок нет. Выделите текст во вкладке «Читать», чтобы оставить заметку.</div>'}
+    <p class="hint">Сначала нажмите «Синхронизировать», затем скопируйте задание в чат T3. Все обсуждения — в чате.</p>
+    ${shown.length ? '' : '<div class="empty">Заметок нет. Нажмите на абзац во вкладке «Править», чтобы оставить заметку.</div>'}
     ${shown.map(n => `<div class="note ${n.status !== 'open' ? 'done' : ''}">
       <div class="row"><span class="type ${n.type}">${WHO[n.type] || n.type}</span><span class="meta">${fmtDate(n.createdAt)} · ${STATUS[n.status] || n.status}${pendingIds.has(n.id) ? ' · не отправлено' : ''}</span></div>
       ${n.legacy?.differentText ? '<p class="hint">Заметка перенесена с прежнего текста. Проверьте её актуальность.</p>' : ''}
@@ -779,17 +810,17 @@ function renderNotes(ch) {
       <div class="c">${esc(n.comment)}</div>
       ${(n.replies || []).map(r => `<div class="reply"><div class="who">${esc(r.by)} · <span class="meta">${fmtDate(r.at)}</span></div>${esc(r.text)}</div>`).join('')}
       <div class="row end mt">
-        <button class="btn" data-reply="${esc(n.id)}">Ответить</button>
+        <button class="btn" data-modify="${esc(n.id)}">Изменить / удалить</button>
         ${n.status === 'open' ? `<button class="btn" data-close="${esc(n.id)}">Закрыть</button>` : `<button class="btn" data-reopen="${esc(n.id)}">Открыть снова</button>`}
       </div></div>`).join('')}`;
   v.querySelectorAll('[data-f]').forEach(b => b.onclick = () => go({ noteFilter: b.dataset.f }));
   $('#noteAll').onclick = () => noteSheet(ch, { quote: '', prefix: '' });
   $('#taskGPT').onclick = () => copyAgentTask(ch, 'GPT');
   $('#taskClaude').onclick = () => copyAgentTask(ch, 'Claude');
-  v.querySelectorAll('[data-goto]').forEach(b => b.onclick = () => go({ tab: 'read', scrollTo: b.dataset.goto }));
+  v.querySelectorAll('[data-goto]').forEach(b => b.onclick = () => go({ tab: 'edit', rawEdit: false, scrollTo: b.dataset.goto }));
   v.querySelectorAll('[data-close]').forEach(b => b.onclick = () => enqueue({ type: 'note-set', chapter: ch.id, id: b.dataset.close, fields: { status: 'done', closedAt: new Date().toISOString() } }));
   v.querySelectorAll('[data-reopen]').forEach(b => b.onclick = () => enqueue({ type: 'note-set', chapter: ch.id, id: b.dataset.reopen, fields: { status: 'open' } }));
-  v.querySelectorAll('[data-reply]').forEach(b => b.onclick = () => replySheet(ch, b.dataset.reply));
+  v.querySelectorAll('[data-modify]').forEach(b => b.onclick = () => readNoteSheet(ch, notesOf(ch.id).find(n => n.id === b.dataset.modify)));
 }
 function replySheet(ch, id) {
   const d = $('#sheet');
@@ -805,9 +836,9 @@ function replySheet(ch, id) {
 }
 
 async function copyAgentTask(ch, agent) {
-  if (queue.some(op => op.chapter === ch.id)) return alert('Сначала подключитесь к Интернету и дождитесь отправки изменений этой главы.');
+  if (queue.some(op => op.chapter === ch.id)) return alert('Сначала нажмите «Синхронизировать» и дождитесь отправки изменений этой главы.');
   const edition = editions().find(e => e.id === editionOf(ch))?.title || editionOf(ch);
-  const text = `Работай с закрытым репозиторием ${cfg.owner}/${cfg.repo}, ветка ${branch()}. Прочитай AGENTS.md и редактор/README.md, получи свежие изменения без перезаписи чужих правок. Редакция: ${edition}. Глава: ${ch.title}, постоянный id: ${ch.id}, файл: ${ch.file}. Ответь на открытые заметки из ${notesPath(ch.id)} в replies от имени ${agent}. По замечаниям подготовь предложение с правками по правилам README, не переписывай главу. Не меняй другую редакцию романа. Если заметка к прежнему тексту, сначала проверь актуальность. Проверь JSON, сохрани только свои изменения, выполни commit и push без force. Коротко сообщи результат.`;
+  const text = `Работай с закрытым репозиторием ${cfg.owner}/${cfg.repo}, ветка ${branch()}. Прочитай AGENTS.md и редактор/README.md, получи свежие изменения без перезаписи чужих правок. Редакция: ${edition}. Глава: ${ch.title}, постоянный id: ${ch.id}, файл: ${ch.file}. Обсуди открытые заметки из ${notesPath(ch.id)} со мной в этом чате от имени ${agent}. Не добавляй ответы в replies. Пропускай заметки с deleted: true. По замечаниям подготовь предложение с правками по правилам README, не переписывай главу. Не меняй другую редакцию романа. Если заметка к прежнему тексту, сначала проверь актуальность. Проверь JSON, сохрани только свои изменения, выполни commit и push без force. Коротко сообщи результат.`;
   try { await navigator.clipboard.writeText(text); alert('Задание скопировано. Вставьте его в чат ' + agent + ' в T3.'); }
   catch {
     const d = $('#sheet');
@@ -1182,8 +1213,8 @@ function renderSettings() {
     try {
       const r = await gh(repoPath());
       if (!r.permissions?.push) { res.className = 'bad'; res.textContent = 'Ключ даёт только чтение. Включите Contents: Read and write.'; return; }
-      res.className = 'ok'; res.textContent = 'Готово, доступ есть. Загружаю главы…';
-      syncError = null; await sync(); go({ screen: 'chapters' });
+      res.className = 'ok'; res.textContent = 'Доступ есть. Нажмите «Синхронизировать», чтобы загрузить главы.';
+      syncError = null; go({ screen: 'chapters' });
     } catch (e) {
       res.className = 'bad';
       res.textContent = !navigator.onLine ? 'Нет Интернета.' : e.status === 401 ? 'Ключ не подходит.' : e.status === 404 ? 'Репозиторий не найден или ключ не даёт к нему доступ.' : 'Ошибка: ' + (e.detail || e.message);
@@ -1226,10 +1257,11 @@ document.addEventListener('click', e => {
   const again = document.querySelector(`[data-dmode="${b.dataset.dmode}"]`);
   if (again) window.scrollBy(0, again.getBoundingClientRect().top - y);
 });
-addEventListener('online', () => sync());
+addEventListener('online', renderStatus);
 addEventListener('offline', renderStatus);
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); });
-setInterval(() => { if (document.visibilityState === 'visible') sync(); }, 5 * 60 * 1000);
+addEventListener('scroll', rememberReading, { passive: true });
+document.documentElement.dataset.theme = ui.theme || '';
+
 if ('serviceWorker' in navigator) {
   // Reload automatically only on the idle home screen; active forms and proposal
   // reviews get an update button instead of losing unsaved input.
@@ -1250,4 +1282,3 @@ if ('serviceWorker' in navigator) {
 if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
 
 render();
-sync();

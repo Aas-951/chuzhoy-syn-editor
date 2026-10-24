@@ -173,3 +173,14 @@ a { color: var(--accent); }
 .read-actions .para-add { color: var(--muted); border: 1px solid var(--line); }
 .read-actions .note-marker { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
 .sheet .c, .sheet .reply { white-space: pre-wrap; }
+:root[data-theme="light"] {
+  --bg: #faf8f4; --fg: #1f2328; --muted: #6b7280; --line: #e5e1d8; --card: #fff;
+  --accent: #2563eb; --accent-fg: #fff; --mark: rgba(250, 204, 21, .45);
+}
+:root[data-theme="dark"] {
+  --bg: #17181b; --fg: #e6e4df; --muted: #9ca3af; --line: #2c2e33; --card: #202226;
+  --accent: #60a5fa; --accent-fg: #0b1220; --mark: rgba(250, 204, 21, .3);
+}
+.article { padding: 8px 8px 32px; line-height: 1.75; }
+.read-row > p { cursor: pointer; }
+#noteEdit { min-height: 160px; }

@@ -47,6 +47,38 @@ function harness(savedStorage = []) {
   return { run, files, storage, elements, put, ctx, hook: f => { onRequest = f; }, quota: value => { failStorage = value; }, calls: () => calls };
 }
 
+test('saving online persists locally without scheduling network work', () => {
+  const h = harness(); let timers = 0;
+  h.ctx.setTimeout = () => { timers++; };
+  h.run('enqueue({type:"note-add",chapter:"gpt17",note:{id:"local",status:"open",comment:"Draft"}})');
+  assert.equal(h.calls(), 0); assert.equal(timers, 0);
+  assert.equal(JSON.parse(h.storage.get('cs.queue'))[0].note.id, 'local');
+});
+
+test('deleting and restoring notes survives reload and sync without losing replies', async () => {
+  const h = harness();
+  h.put(notesPath, JSON.stringify({notes:[{id:'n1',status:'open',comment:'Keep',replies:[{id:'r1',text:'Archive'}]}]}));
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files)));
+  h.run('enqueue({type:"note-set",chapter:"gpt17",id:"n1",fields:{deleted:true}})');
+  assert.equal(h.run('notesOf("gpt17").length'), 0);
+  const reloaded = harness([...h.storage]);
+  assert.equal(reloaded.run('queue[0].fields.deleted'), true);
+  await h.run('pushQueue()');
+  assert.equal(h.run('notesOf("gpt17").length'), 0);
+  h.run('enqueue({type:"note-set",chapter:"gpt17",id:"n1",fields:{deleted:false}})');
+  await h.run('pushQueue()');
+  assert.equal(h.run('notesOf("gpt17")[0].replies[0].text'), 'Archive');
+});
+
+test('reading mode has no note controls and remembers the last chapter', () => {
+  const h = harness();
+  h.run('route={screen:"chapter",chapter:"gpt17",tab:"read"};renderRead(chapterById("gpt17"))');
+  const html = h.elements.get('#view').innerHTML;
+  assert.doesNotMatch(html, /id="rawEdit"|id="resumeNote"|para-add/);
+  assert.match(html, /id="theme"/);
+  assert.equal(JSON.parse(h.storage.get('cs.ui')).lastChapter, 'gpt17');
+});
+
 test('quote relocation uses both contexts across paragraphs and refuses ambiguous matches', () => {
   const h = harness();
   h.ctx.blocks = ['Первый берег далеко.', 'Другой берег близко.'];
@@ -272,10 +304,10 @@ test('proposal can be read as clean text with checked changes; reader links to i
   html=h.elements.get('#view').innerHTML;assert.match(html,/id="readNew"/);
 });
 
-test('paragraph view lists paragraphs and attaches notes; raw editor on request', () => {
+test('legacy paragraph view remains readable; raw editor on explicit request', () => {
   const h=harness();h.put(chapter.file,'## Глава\n\nПервый абзац.\n\nВторой абзац тут.\n');
   h.put(notesPath,JSON.stringify({notes:[{id:'n1',type:'remark',status:'open',quote:'Второй абзац',comment:'Сократить',replies:[]}]}));
-  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';route={screen:"chapter",chapter:"gpt17",tab:"edit"};renderEdit(chapterById("gpt17"))');
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files))+';route={screen:"chapter",chapter:"gpt17",tab:"edit"};renderParagraphs(chapterById("gpt17"),chapterText(chapterById("gpt17")))');
   let html=h.elements.get('#view').innerHTML;
   assert.match(html,/data-para="4"/);assert.match(html,/para noted[^>]*data-para="4"[\s\S]*Сократить/);assert.doesNotMatch(html,/textarea class="editor"/);
   h.run('route.rawEdit=true;renderEdit(chapterById("gpt17"))');html=h.elements.get('#view').innerHTML;
