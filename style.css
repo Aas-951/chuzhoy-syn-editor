@@ -184,3 +184,7 @@ a { color: var(--accent); }
 .article { padding: 8px 8px 32px; line-height: 1.75; }
 .read-row > p { cursor: pointer; }
 #noteEdit { min-height: 160px; }
+.fab.left { right: auto; left: 14px; }
+.read-row.noted > div > p { background: rgba(250, 204, 21, .12); border-radius: 6px; }
+.read-row .pnote { cursor: pointer; }
+.sheet .q { max-height: 35vh; }

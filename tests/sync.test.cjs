@@ -129,8 +129,30 @@ test('note save failure keeps the dialog and recovery draft; other edition has i
 
 test('proposal notes are not highlighted as notes of the current chapter', () => {
   const h = harness();
-  h.put(notesPath,JSON.stringify({notes:[{id:'live',status:'open',quote:'текст'},{id:'p',status:'open',quote:'текст',proposal:'pp',part:1}]}));
   h.run('data.files='+JSON.stringify(Object.fromEntries(h.files)));
+  const cur = h.run('data.files[chapterById("gpt17").file].sha');
+  h.run('data.files[notesPath("gpt17")]={text:JSON.stringify({notes:[{id:"live",status:"open",quote:"текст",chapterSha:'+JSON.stringify(cur)+'},{id:"p",status:"open",quote:"текст",proposal:"pp",part:1,chapterSha:'+JSON.stringify(cur)+'}]})}');
+  assert.equal(h.run('liveNotes(chapterById("gpt17")).length'), 1);
+});
+
+test('notes to an earlier version are hidden in the text but kept in the list', () => {
+  const h = harness();
+  h.run('data.files='+JSON.stringify(Object.fromEntries(h.files)));
+  h.run('data.files[notesPath("gpt17")]={text:JSON.stringify({notes:[{id:"old",status:"open",quote:"текст",chapterSha:"older-sha"},{id:"legacy",status:"open",quote:"текст"}]})}');
+  assert.equal(h.run('liveNotes(chapterById("gpt17")).length'), 0);
+  assert.equal(h.run('openNotes("gpt17").length'), 2);
+});
+
+test('a note written over an unsent edit is shown and gets the new version on sync', async () => {
+  const h = harness();
+  await h.run('sync()');
+  h.run('enqueue({type:"edit",chapter:"gpt17",base:data.files[chapterById("gpt17").file].sha,text:"Новый текст главы"})');
+  h.run('enqueue({type:"note-add",chapter:"gpt17",note:{id:"n1",status:"open",quote:"Новый",comment:"к",chapterSha:null,replies:[]}})');
+  assert.equal(h.run('liveNotes(chapterById("gpt17")).length'), 1);
+  await h.run('sync()');
+  assert.equal(h.run('queue.length'), 0);
+  const sha = h.run('data.files[chapterById("gpt17").file].sha');
+  assert.equal(h.run('notesOf("gpt17")[0].chapterSha'), sha);
   assert.equal(h.run('liveNotes(chapterById("gpt17")).length'), 1);
 });
 

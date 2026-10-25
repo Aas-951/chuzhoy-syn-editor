@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 15; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 16; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -233,8 +233,10 @@ async function pushQueue() {
     const ops = queue.filter(o => o.chapter === id && o.type.startsWith('note-'));
     await updateJSON(notesPath(id), { chapter: id, notes: [] }, j => {
       j.notes = j.notes || [];
+      // A note written over an unsent edit belongs to the version that edit just created.
+      const sha = !queue.some(o => o.chapter === id && (o.type === 'edit' || o.type === 'decide')) && data.files[chapterById(id)?.file]?.sha;
       for (const op of ops) {
-        if (op.type === 'note-add' && !j.notes.some(n => n.id === op.note.id)) j.notes.push(op.note);
+        if (op.type === 'note-add' && !j.notes.some(n => n.id === op.note.id)) j.notes.push(sha && !op.note.chapterSha ? { ...op.note, chapterSha: sha } : op.note);
         const n = j.notes.find(n => n.id === op.id);
         if (op.type !== 'note-add' && !n) throw new Error('Заметка не найдена. Ответ сохранён в очереди.');
         if (op.type === 'note-set' && n) Object.assign(n, op.fields);
@@ -350,10 +352,12 @@ async function checkAppUpdate() {
 function appInfoHtml() {
   return `<div class="app-info"><span>Редактор · версия ${APP_VERSION}</span><button class="btn" data-check-update>Проверить обновление</button></div>`;
 }
+const headerBottom = () => $('.top')?.getBoundingClientRect().bottom || 0;
 function rememberReading() {
   if (route.screen !== 'chapter' || !['read', 'edit'].includes(route.tab) || route.rawEdit) return;
   const blocks = [...document.querySelectorAll('#article p, #article h1, #article h2, #article h3')];
-  const index = blocks.findIndex(el => el.getBoundingClientRect().bottom > 90);
+  const line = headerBottom() + 12;
+  const index = blocks.findIndex(el => el.getBoundingClientRect().bottom > line);
   if (index < 0) return;
   ui.positions = ui.positions || {};
   ui.positions[route.chapter] = { index, top: blocks[index].getBoundingClientRect().top };
@@ -390,6 +394,7 @@ function render() {
   $('#tabs').hidden = !inChapter;
   $('#back').hidden = route.screen === 'chapters';
   $('#addNote').hidden = true;
+  $('#nextNote').hidden = true;
   if (route.screen === 'settings') return renderSettings();
   if (!cfg.token) return renderSettings();
   if (!inChapter) return renderChapters();
@@ -499,7 +504,7 @@ function renderRead(ch) {
   v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button><button id="theme">Тема</button></div>
     ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
     ${waiting ? `<div class="row"><span class="hint grow">Это текст до правок. Есть предложение от ${esc(waiting.by || 'агента')}.</span><button class="btn" id="readNew">Читать с правками</button></div>` : ''}
-    ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку. Номер открывает сохранённую заметку.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
+    ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку или дописать её. «Заметка ↓» — к следующей заметке.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
     ${editing && loadNoteDraft(ch.id) ? '<button class="btn" id="resumeNote">Продолжить недописанную заметку</button>' : ''}
     <article class="article" id="article">${mdToHtml(text)}</article>`;
   readSize();
@@ -553,7 +558,15 @@ function rangeForNote(root, note) {
     return r;
 }
 function findRange(root, quote, prefix, suffix = '') { return rangeForNote(root, { quote, prefix, suffix }); }
-const liveNotes = ch => openNotes(ch.id).filter(n => !n.proposal);
+// В тексте видны только заметки к нынешней версии главы. После принятого
+// предложения или другой новой версии прежние заметки остаются во вкладке «Заметки».
+const localNoteIds = id => new Set(queue.filter(o => o.chapter === id && o.type === 'note-add').map(o => o.note.id));
+function onCurrentText(ch, n) {
+  const local = localNoteIds(ch.id).has(n.id);
+  if (pendingEdit(ch.id) || pendingAccept(ch.id)) return local && !n.chapterSha;
+  return n.chapterSha ? n.chapterSha === data.files[ch.file]?.sha : local;
+}
+const liveNotes = ch => openNotes(ch.id).filter(n => !n.proposal && onCurrentText(ch, n));
 function annotateRead(ch) {
   const art = $('#article'); if (!art) return;
   const blocks = [...art.querySelectorAll('p, h1, h2, h3')];
@@ -562,17 +575,22 @@ function annotateRead(ch) {
   const located = notes.map(note => ({ note, at: locateQuote(texts, note) }));
   blocks.forEach((el, i) => {
     if (el.tagName !== 'P') return;
-    const row = document.createElement('div'); row.className = 'read-row';
-    el.before(row); row.append(el);
+    const mine = located.filter(({ at }) => at && at.block === i);
+    const row = document.createElement('div'); row.className = 'read-row' + (mine.length ? ' noted' : '');
+    const body = document.createElement('div');
+    el.before(row); body.append(el); row.append(body);
     const actions = document.createElement('div'); actions.className = 'read-actions';
     const add = document.createElement('button'); add.className = 'para-add'; add.textContent = '＋';
-    add.setAttribute('aria-label', 'Добавить заметку к абзацу');
+    add.setAttribute('aria-label', 'Новая отдельная заметка к абзацу');
     add.onclick = () => noteSheet(ch, { quote: texts[i], prefix: '', suffix: '' }); actions.append(add);
-    el.onclick = () => { if (getSelection().isCollapsed) add.onclick(); };
-    located.forEach(({ note, at }, n) => {
-      if (!at || at.block !== i) return;
-      const b = document.createElement('button'); b.className = 'note-marker'; b.textContent = String(n + 1);
-      b.setAttribute('aria-label', 'Открыть заметку ' + (n + 1)); b.onclick = () => readNoteSheet(ch, note); actions.append(b);
+    // Повторное нажатие на абзац открывает уже написанное, чтобы его дописать.
+    el.onclick = () => { if (!getSelection().isCollapsed) return; mine.length ? readNoteSheet(ch, mine.at(-1).note) : add.onclick(); };
+    mine.forEach(({ note }) => {
+      const n = located.findIndex(l => l.note === note) + 1;
+      const b = document.createElement('button'); b.className = 'note-marker'; b.textContent = String(n);
+      b.setAttribute('aria-label', 'Открыть заметку ' + n); b.onclick = () => readNoteSheet(ch, note); actions.append(b);
+      const shown = document.createElement('div'); shown.className = 'pnote'; shown.textContent = note.comment;
+      shown.onclick = () => readNoteSheet(ch, note); body.append(shown);
     });
     row.append(actions);
   });
@@ -582,6 +600,18 @@ function annotateRead(ch) {
     warning.textContent = `Не удалось однозначно найти цитату у заметок: ${detached}. Они сохранены во вкладке «Заметки».`;
     art.before(warning);
   }
+  $('#nextNote').hidden = !art.querySelector('.read-row.noted');
+}
+// «Заметка ↓»: к следующей заметке ниже верха экрана; после последней — снова первая.
+function nextNote() {
+  const rows = [...document.querySelectorAll('#article .read-row.noted')]; if (!rows.length) return;
+  if (notice) { notice = ''; renderBanner(); }
+  const line = headerBottom() + 12;
+  let next = rows.find(r => r.getBoundingClientRect().top > line);
+  if (!next) { next = rows[0]; notice = 'Это была последняя заметка, снова первая.'; renderBanner(); }
+  window.scrollBy(0, next.getBoundingClientRect().top - headerBottom() - 8);
+  next.classList.add('flash'); setTimeout(() => next.classList.remove('flash'), 1700);
+  rememberReading();
 }
 function readNoteSheet(ch, note) {
   const d = $('#sheet');
@@ -591,7 +621,9 @@ function readNoteSheet(ch, note) {
     <div class="row end"><button class="btn danger" id="noteDelete">Удалить</button><button class="btn" id="noteClose">Отмена</button><button class="btn primary" id="noteSave">Сохранить</button></div>`;
   $('#noteEdit').value = load(key, note.comment);
   $('#noteEdit').oninput = () => save(key, $('#noteEdit').value);
-  d.showModal(); $('#noteClose').onclick = () => { localStorage.removeItem(key); d.close(); };
+  d.showModal();
+  const edit = $('#noteEdit'); edit.focus(); edit.setSelectionRange(edit.value.length, edit.value.length);
+  $('#noteClose').onclick = () => { localStorage.removeItem(key); d.close(); };
   $('#noteSave').onclick = () => {
     const comment = $('#noteEdit').value.trim(); if (!comment) return;
     if (!enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { comment } })) return;
@@ -636,6 +668,7 @@ document.addEventListener('selectionchange', () => {
   fab.hidden = false;
 });
 $('#addNote').onclick = () => { if (selectionInfo) noteSheet(chapterById(route.chapter), selectionInfo); };
+$('#nextNote').onclick = nextNote;
 
 const noteDraftKey = id => 'cs.noteDraft.' + id;
 function loadNoteDraft(id) {
@@ -792,6 +825,7 @@ function renderNotes(ch) {
     ${shown.map(n => `<div class="note ${n.status !== 'open' ? 'done' : ''}">
       <div class="row"><span class="type ${n.type}">${WHO[n.type] || n.type}</span><span class="meta">${fmtDate(n.createdAt)} · ${STATUS[n.status] || n.status}${pendingIds.has(n.id) ? ' · не отправлено' : ''}</span></div>
       ${n.legacy?.differentText ? '<p class="hint">Заметка перенесена с прежнего текста. Проверьте её актуальность.</p>' : ''}
+      ${!n.proposal && n.status === 'open' && !onCurrentText(ch, n) ? '<p class="hint">К прежней версии текста — в главе не показывается.</p>' : ''}
       ${n.proposal ? `<p class="hint">К предложению ${esc(n.proposal)}, правка ${esc(String(n.part))}</p>` : ''}
       ${n.quote ? `<div class="q" data-goto="${esc(n.id)}">${esc(n.quote)}</div>` : ''}
       <div class="c">${esc(n.comment)}</div>
