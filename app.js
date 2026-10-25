@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 19; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 20; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -515,19 +515,73 @@ function renderRead(ch) {
   if (text == null) { v.innerHTML = '<div class="empty">Глава ещё не загружена — нужен Интернет.</div>'; return; }
   ui.lastChapter = ch.id; save(KEY.ui, ui);
   const waiting = proposalsOf(ch.id).filter(p => p.status === 'pending' && data.files[p.file]).sort((a, b) => (b.at || '').localeCompare(a.at || ''))[0];
-  v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button><button id="theme">Тема</button></div>
+  const kg = kgRegex(ch);
+  v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button><button id="theme">Тема</button>${kg ? `<button id="kgToggle" aria-pressed="${ui.kg !== false}">${ui.kg !== false ? 'Кырг. ✓' : 'Кырг.'}</button>` : ''}</div>
     ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
     ${waiting ? `<div class="row"><span class="hint grow">Это текст до правок. Есть предложение от ${esc(waiting.by || 'агента')}.</span><button class="btn" id="readNew">Читать с правками</button></div>` : ''}
     ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку или дописать её. «Заметка ↓» — к следующей заметке.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
     ${editing && loadNoteDraft(ch.id) ? '<button class="btn" id="resumeNote">Продолжить недописанную заметку</button>' : ''}
     <article class="article" id="article">${mdToHtml(text)}</article>`;
   readSize();
+  if (kg && ui.kg !== false) markKyrgyz($('#article'), kg);
+  if (kg) $('#kgToggle').onclick = () => { ui.kg = ui.kg === false; save(KEY.ui, ui); render(); };
   if (waiting) $('#readNew').onclick = () => go({ tab: 'proposals', proposal: waiting.id, clean: true });
   $('#theme').onclick = () => { ui.theme = ui.theme === 'dark' ? 'light' : 'dark'; save(KEY.ui, ui); document.documentElement.dataset.theme = ui.theme; };
   if (editing) { annotateRead(ch); $('#rawEdit').onclick = () => go({ rawEdit: true }); }
   if (editing && loadNoteDraft(ch.id)) $('#resumeNote').onclick = () => noteSheet(ch, {});
   if (editing) highlightNotes(ch); else window.CSS?.highlights?.delete('note');
   if (route.scrollTo) { const id = route.scrollTo; route.scrollTo = null; scrollToNote(ch, id); } else restoreReading(ch);
+}
+
+// Словарь редакции — запись в главы.json с "glossary": true. Его раздел
+// «Слова для подсветки» (через запятую) выделяется в главах жирным, чтобы
+// автор видел кыргызские слова, ещё не попавшие в словарь. Слово с заглавной
+// буквы ищется только с заглавной («Же», не русское «же»); «*» в конце —
+// любое окончание («боорсок*»).
+const glossaryOf = ch => ch.glossary ? null : chapters().find(c => c.glossary && editionOf(c) === editionOf(ch));
+function kgTerms(text) {
+  const lines = toLF(text || '').split('\n');
+  const start = lines.findIndex(l => /^##\s*Слова для подсветки\s*$/.test(l));
+  if (start < 0) return [];
+  const end = lines.findIndex((l, i) => i > start && /^##\s/.test(l));
+  const body = lines.slice(start + 1, end < 0 ? undefined : end).filter(l => !l.trim().startsWith('('));
+  return [...new Set(body.join(',').split(',').map(s => s.trim()).filter(Boolean))];
+}
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function kgPattern(term) {
+  const star = term.endsWith('*'), core = star ? term.slice(0, -1) : term;
+  let body = core.split(/\s+/).map(escRe).join('\\s+');
+  const first = core[0];
+  if (first !== first.toUpperCase()) body = `[${first}${first.toUpperCase()}]` + body.slice(escRe(first).length);
+  return body + (star ? '[\\p{L}\\p{N}]*' : '');
+}
+const kgCache = {};
+function kgRegex(ch) {
+  const g = glossaryOf(ch), text = g && data.files[g.file]?.text;
+  if (!text) return null;
+  if (kgCache.text !== text) {
+    const terms = kgTerms(text).sort((a, b) => b.length - a.length);
+    kgCache.text = text;
+    kgCache.re = terms.length ? new RegExp(`(?<![\\p{L}\\p{N}])(?:${terms.map(kgPattern).join('|')})(?![\\p{L}\\p{N}])`, 'gu') : null;
+  }
+  return kgCache.re;
+}
+function markKyrgyz(root, re) {
+  if (!root || !re) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = []; while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) {
+    const s = node.data, found = [...s.matchAll(re)];
+    if (!found.length) continue;
+    const frag = document.createDocumentFragment(); let last = 0;
+    for (const m of found) {
+      if (m.index > last) frag.append(s.slice(last, m.index));
+      const b = document.createElement('b'); b.className = 'kg'; b.textContent = m[0]; frag.append(b);
+      last = m.index + m[0].length;
+    }
+    if (last < s.length) frag.append(s.slice(last));
+    node.replaceWith(frag);
+  }
 }
 
 const norm = s => s.replace(/\s+/g, ' ').trim();

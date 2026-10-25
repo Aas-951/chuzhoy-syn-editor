@@ -488,3 +488,26 @@ test('saving the same note again does not grow the queue; the button counts note
   h.run('renderStatus()');
   assert.equal(h.elements.get('#syncText').textContent, 'Синхронизировать · 3');
 });
+
+test('glossary words are found in chapter text; capitalised terms keep their case', () => {
+  const h = harness();
+  const kgTerms = h.run('kgTerms'), kgPattern = h.run('kgPattern');
+  const glossary = ['## Слово', '', '## Слова для подсветки', '', '(пояснение, не термин)', '',
+    'балам, Же, боорсок*, жылбай тур, түш бери', '', '## Дальше', '', 'не термин'].join('\n');
+  const terms = [...kgTerms(glossary)];
+  assert.deepEqual(terms, ['балам', 'Же', 'боорсок*', 'жылбай тур', 'түш бери']);
+  const edge = String.raw`[\p{L}\p{N}]`;
+  const re = new RegExp(`(?<!${edge})(?:${terms.map(kgPattern).join('|')})(?!${edge})`, 'gu');
+  const found = s => [...s.matchAll(re)].map(m => m[0]);
+  assert.deepEqual(found('Балам, иди. Вспомнил же. Же, балам. Бери боорсоки. Тур, жылбай  тур! Түш бери.'),
+    ['Балам', 'Же', 'балам', 'боорсоки', 'жылбай  тур', 'Түш бери']);
+  assert.deepEqual(found('ребалам набалам'), []);
+});
+
+test('chapters of an edition get the regex from its glossary; the glossary itself does not', () => {
+  const h = harness();
+  h.run('data.files[MANIFEST].text = JSON.stringify({chapters:[...chapters(), {id:"g",title:"Словарь",file:"g.md",edition:editionOf(chapterById("gpt17")),glossary:true}]})');
+  h.run('data.files["g.md"] = {sha:"g", text:"## Слова для подсветки\\n\\nбалам"}');
+  assert.equal(h.run('kgRegex(chapterById("gpt17")) instanceof RegExp'), true);
+  assert.equal(h.run('kgRegex(chapterById("g"))'), null);
+});

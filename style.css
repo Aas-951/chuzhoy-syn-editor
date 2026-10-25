@@ -191,3 +191,4 @@ a { color: var(--accent); }
 .sync.need { color: var(--accent); border-color: var(--accent); font-weight: 600; }
 .sync.done { color: var(--ok); }
 .dot.need { background: var(--accent); }
+.article b.kg { font-weight: 700; }
