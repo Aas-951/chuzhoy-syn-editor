@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 16; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 17; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -306,15 +306,22 @@ function banner(html, bad) {
   b.innerHTML = html; b.className = 'banner' + (bad ? ' bad' : ''); b.hidden = false;
 }
 
+// Кнопка показывает одно из двух: «Синхронизировать» — на телефоне есть
+// неотправленное; «✓ Синхронизировано» — всё отправлено и загружено.
 function renderStatus() {
-  const dot = $('#dot'), t = $('#syncText');
+  const dot = $('#dot'), t = $('#syncText'), b = $('#sync');
   const n = queue.length;
+  b.classList.remove('need', 'done');
+  b.title = data.syncedAt ? 'Последняя синхронизация: ' + fmtDate(data.syncedAt) : '';
   if (syncing) { dot.className = 'dot busy'; t.textContent = 'Синхронизация…'; return; }
   if (!cfg.token) { dot.className = 'dot err'; t.textContent = 'Настройки'; return; }
-  if (!navigator.onLine) { dot.className = 'dot off'; t.textContent = n ? `Без сети · ждут: ${n}` : 'Без сети'; return; }
-  if (syncError) { dot.className = 'dot err'; t.textContent = n ? `Ошибка · ждут: ${n}` : 'Ошибка'; return; }
-  dot.className = 'dot on'; t.textContent = n ? `Синхронизировать · ${n}` : 'Синхронизировать';
-  $('#sync').title = n ? `На устройстве: ${n} изменений` : data.syncedAt ? 'Всё синхронизировано' : 'Загрузить главы';
+  if (syncError) { dot.className = 'dot err'; t.textContent = n ? `Ошибка · не отправлено: ${n}` : 'Ошибка — повторить'; return; }
+  if (n) {
+    dot.className = navigator.onLine ? 'dot need' : 'dot off'; b.classList.add('need');
+    t.textContent = navigator.onLine ? `Синхронизировать · ${n}` : `Без сети · не отправлено: ${n}`; return;
+  }
+  if (!data.syncedAt) { dot.className = navigator.onLine ? 'dot need' : 'dot off'; b.classList.add('need'); t.textContent = navigator.onLine ? 'Загрузить главы' : 'Без сети'; return; }
+  dot.className = 'dot on'; b.classList.add('done'); t.textContent = '✓ Синхронизировано';
 }
 
 let notice = '';

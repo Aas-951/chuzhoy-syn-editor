@@ -188,3 +188,6 @@ a { color: var(--accent); }
 .read-row.noted > div > p { background: rgba(250, 204, 21, .12); border-radius: 6px; }
 .read-row .pnote { cursor: pointer; }
 .sheet .q { max-height: 35vh; }
+.sync.need { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.sync.done { color: var(--ok); }
+.dot.need { background: var(--accent); }

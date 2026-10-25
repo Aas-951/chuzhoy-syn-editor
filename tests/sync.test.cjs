@@ -16,7 +16,7 @@ function harness(savedStorage = []) {
   put(manifestPath, JSON.stringify({ editions: [{ id: 'gpt', title: 'Codex · 17 глав' }, { id: 'vaal', title: 'Адриан Ваал' }], chapters: [vaal, chapter] }));
   put(proposalsPath, '{"proposals":[]}'); put(chapter.file, 'Исходный текст'); put(vaal.file, 'Ваал');
   let onRequest = null, failStorage = false, calls = 0;
-  const node = () => ({ innerHTML: '', textContent: '', value: '', dataset: {}, hidden: false, open: false, classList: { toggle() {} }, querySelectorAll() { return []; }, querySelector() { return { value: 'remark' }; }, showModal() { this.open = true; }, close() { this.open = false; }, focus() {} });
+  const node = () => ({ innerHTML: '', textContent: '', value: '', dataset: {}, hidden: false, open: false, classList: { _s: new Set(), toggle() {}, add(...c) { c.forEach(x => this._s.add(x)); }, remove(...c) { c.forEach(x => this._s.delete(x)); }, contains(c) { return this._s.has(c); } }, querySelectorAll() { return []; }, querySelector() { return { value: 'remark' }; }, showModal() { this.open = true; }, close() { this.open = false; }, focus() {} });
   const ctx = vm.createContext({ console, TextEncoder, TextDecoder, Uint8Array, URL, Date,
     atob: x => Buffer.from(x, 'base64').toString('binary'), btoa: x => Buffer.from(x, 'binary').toString('base64'),
     setTimeout() { return 1; }, clearTimeout() {}, setInterval() {}, alert() {}, confirm() { return true; },
@@ -461,4 +461,16 @@ test('accepted proposal can be fetched after synchronization removed its cached 
   const html=h.elements.get('#view').innerHTML;
   assert.match(html,/Это исходный текст предложения агента/);assert.match(html,/Текст предложения/);
   assert.match(html,/принято частично: 1 из 2/);
+});
+
+test('sync button says what to do: synchronize when something is unsent, synchronized when done', async () => {
+  const h = harness();
+  const label = () => h.elements.get('#syncText').textContent;
+  await h.run('sync()'); h.run('renderStatus()');
+  assert.equal(label(), '✓ Синхронизировано');
+  h.run('enqueue({type:"note-add",chapter:"gpt17",note:{id:"s1",status:"open",quote:"",comment:"к",replies:[]}});renderStatus()');
+  assert.equal(label(), 'Синхронизировать · 1');
+  await h.run('sync()');
+  assert.equal(h.run('queue.length'), 0); h.run('renderStatus()');
+  assert.equal(label(), '✓ Синхронизировано');
 });
