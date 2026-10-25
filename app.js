@@ -1,7 +1,7 @@
 'use strict';
 // Редактор «Чужой сын». Без сервера: главы и заметки лежат в закрытом
 // репозитории GitHub, телефон держит копию у себя и отправляет очередь,
-// по кнопке «Синхронизировать». Формат данных описан в редактор/README.md репозитория.
+// по кнопке «Синхронизировать» и один раз при открытии. Формат данных описан в редактор/README.md репозитория.
 
 const API = 'https://api.github.com';
 const branch = () => cfg.branch || 'main';   // другая ветка — только для проверки редактора
@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 17; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 18; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -1310,3 +1310,6 @@ if ('serviceWorker' in navigator) {
 if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
 
 render();
+// При открытии редактора — одна синхронизация, если есть сеть и ключ.
+// Возвращение в приложение, появление сети и таймеры её не запускают.
+if (cfg.token && navigator.onLine) sync();
