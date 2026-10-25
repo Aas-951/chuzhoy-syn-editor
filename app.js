@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 18; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 19; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -133,10 +133,17 @@ function enqueue(op) {
   if (op.type === 'edit') {
     const prev = pendingEdit(op.chapter);
     queue = prev ? queue.map(item => item === prev ? { ...prev, text: op.text, at: op.at, operationId: op.operationId } : item) : [...queue, op];
+  } else if (op.type === 'note-set') {
+    // Повторные сохранения одной заметки — одно изменение в очереди, не новое каждый раз.
+    const prev = queue.find(o => o.type === 'note-set' && o.chapter === op.chapter && o.id === op.id);
+    queue = prev ? queue.map(item => item === prev ? { ...prev, fields: { ...prev.fields, ...op.fields }, at: op.at, operationId: op.operationId } : item) : [...queue, op];
   } else queue = [...queue, op];
   if (!saveQueue()) { queue = before; return false; }
   render(); return true;
 }
+
+// Сколько изменений ждёт отправки: заметка, правка главы, решение — по одному, сколько бы раз их ни сохраняли.
+const pendingCount = () => new Set(queue.map(o => o.type.startsWith('note-') ? 'n:' + o.chapter + ':' + (o.note?.id || o.id) : o.type === 'edit' ? 'e:' + o.chapter : 'd:' + o.id)).size;
 
 // ---------- синхронизация ----------
 
@@ -310,7 +317,7 @@ function banner(html, bad) {
 // неотправленное; «✓ Синхронизировано» — всё отправлено и загружено.
 function renderStatus() {
   const dot = $('#dot'), t = $('#syncText'), b = $('#sync');
-  const n = queue.length;
+  const n = pendingCount();
   b.classList.remove('need', 'done');
   b.title = data.syncedAt ? 'Последняя синхронизация: ' + fmtDate(data.syncedAt) : '';
   if (syncing) { dot.className = 'dot busy'; t.textContent = 'Синхронизация…'; return; }
@@ -620,28 +627,38 @@ function nextNote() {
   next.classList.add('flash'); setTimeout(() => next.classList.remove('flash'), 1700);
   rememberReading();
 }
+// «Сохранить» — пока в поле есть несохранённое; после нажатия — «✓ Сохранено».
 function readNoteSheet(ch, note) {
   const d = $('#sheet');
   const key = 'cs.noteEdit.' + ch.id + '.' + note.id;
+  let saved = note.comment || '';
   d.innerHTML = `<h3>Заметка</h3><div class="q">${esc(note.quote || '')}</div>
     <textarea id="noteEdit" aria-label="Заметка"></textarea>
-    <div class="row end"><button class="btn danger" id="noteDelete">Удалить</button><button class="btn" id="noteClose">Отмена</button><button class="btn primary" id="noteSave">Сохранить</button></div>`;
-  $('#noteEdit').value = load(key, note.comment);
-  $('#noteEdit').oninput = () => save(key, $('#noteEdit').value);
-  d.showModal();
-  const edit = $('#noteEdit'); edit.focus(); edit.setSelectionRange(edit.value.length, edit.value.length);
+    <div class="row end"><button class="btn danger" id="noteDelete">Удалить</button><button class="btn" id="noteClose">Закрыть</button><button class="btn primary" id="noteSave"></button></div>`;
+  const edit = $('#noteEdit');
+  edit.value = load(key, saved);
+  const state = () => {
+    const dirty = edit.value.trim() !== saved.trim();
+    $('#noteSave').textContent = dirty ? 'Сохранить' : '✓ Сохранено';
+    $('#noteSave').disabled = !dirty || !edit.value.trim();
+    $('#noteClose').textContent = dirty ? 'Отмена' : 'Закрыть';
+  };
+  state();
+  edit.oninput = () => { save(key, edit.value); state(); };
+  if (!d.open) d.showModal();
+  edit.focus(); edit.setSelectionRange(edit.value.length, edit.value.length);
   $('#noteClose').onclick = () => { localStorage.removeItem(key); d.close(); };
   $('#noteSave').onclick = () => {
-    const comment = $('#noteEdit').value.trim(); if (!comment) return;
+    const comment = edit.value.trim(); if (!comment || comment === saved.trim()) return state();
     if (!enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { comment } })) return;
-    localStorage.removeItem(key); d.close();
+    localStorage.removeItem(key); saved = comment; state();
   };
   $('#noteDelete').onclick = () => {
     if (!enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { deleted: true, status: 'done' } })) return;
     localStorage.removeItem(key);
     d.innerHTML = '<h3>Заметка удалена</h3><div class="row end"><button class="btn" id="undoDelete">Отменить удаление</button><button class="btn" id="doneDelete">Закрыть</button></div>';
     $('#doneDelete').onclick = () => d.close();
-    $('#undoDelete').onclick = () => { if (enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { deleted: false, status: note.status } })) readNoteSheet(ch, note); };
+    $('#undoDelete').onclick = () => { if (enqueue({ type: 'note-set', chapter: ch.id, id: note.id, fields: { deleted: false, status: note.status } })) readNoteSheet(ch, { ...note, comment: saved }); };
   };
 }
 function highlightNotes(ch) {
@@ -705,13 +722,16 @@ function noteSheet(ch, anchor) {
   };
   $('#ok').onclick = () => {
     const comment = $('#noteText').value.trim(); if (!comment) return $('#noteText').focus();
+    const id = uid('n');
     if (!enqueue({ type: 'note-add', chapter: ch.id, note: {
-      id: uid('n'), type: draft.type || 'remark', status: 'open',
+      id, type: draft.type || 'remark', status: 'open',
       quote, prefix, suffix, comment, author: 'автор', createdAt: new Date().toISOString(),
       chapterSha: draft.chapterSha, replies: [],
     } })) return;
     localStorage.removeItem(noteDraftKey(ch.id));
-    d.close(); getSelection().removeAllRanges(); $('#addNote').hidden = true; render();
+    getSelection().removeAllRanges(); $('#addNote').hidden = true;
+    // Окно остаётся открытым уже для сохранённой заметки: видно «✓ Сохранено», можно дописать.
+    readNoteSheet(ch, notesOf(ch.id).find(n => n.id === id));
   };
 }
 

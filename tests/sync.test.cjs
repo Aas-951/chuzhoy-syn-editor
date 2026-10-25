@@ -16,7 +16,7 @@ function harness(savedStorage = []) {
   put(manifestPath, JSON.stringify({ editions: [{ id: 'gpt', title: 'Codex · 17 глав' }, { id: 'vaal', title: 'Адриан Ваал' }], chapters: [vaal, chapter] }));
   put(proposalsPath, '{"proposals":[]}'); put(chapter.file, 'Исходный текст'); put(vaal.file, 'Ваал');
   let onRequest = null, failStorage = false, calls = 0;
-  const node = () => ({ innerHTML: '', textContent: '', value: '', dataset: {}, hidden: false, open: false, classList: { _s: new Set(), toggle() {}, add(...c) { c.forEach(x => this._s.add(x)); }, remove(...c) { c.forEach(x => this._s.delete(x)); }, contains(c) { return this._s.has(c); } }, querySelectorAll() { return []; }, querySelector() { return { value: 'remark' }; }, showModal() { this.open = true; }, close() { this.open = false; }, focus() {} });
+  const node = () => ({ innerHTML: '', textContent: '', value: '', dataset: {}, hidden: false, open: false, classList: { _s: new Set(), toggle() {}, add(...c) { c.forEach(x => this._s.add(x)); }, remove(...c) { c.forEach(x => this._s.delete(x)); }, contains(c) { return this._s.has(c); } }, querySelectorAll() { return []; }, querySelector() { return { value: 'remark' }; }, showModal() { this.open = true; }, close() { this.open = false; }, focus() {}, setSelectionRange() {} });
   const ctx = vm.createContext({ console, TextEncoder, TextDecoder, Uint8Array, URL, Date,
     atob: x => Buffer.from(x, 'base64').toString('binary'), btoa: x => Buffer.from(x, 'binary').toString('base64'),
     setTimeout() { return 1; }, clearTimeout() {}, setInterval() {}, alert() {}, confirm() { return true; },
@@ -473,4 +473,18 @@ test('sync button says what to do: synchronize when something is unsent, synchro
   await h.run('sync()');
   assert.equal(h.run('queue.length'), 0); h.run('renderStatus()');
   assert.equal(label(), '✓ Синхронизировано');
+});
+
+test('saving the same note again does not grow the queue; the button counts notes, not saves', () => {
+  const h = harness();
+  h.run('data.files[notesPath("gpt17")]={text:JSON.stringify({notes:[{id:"a",status:"open",quote:"q",comment:"one"},{id:"b",status:"open",quote:"q",comment:"two"}]})}');
+  for (let i = 0; i < 3; i++) h.run('enqueue({type:"note-set",chapter:"gpt17",id:"a",fields:{comment:"one more ' + i + '"}})');
+  h.run('enqueue({type:"note-set",chapter:"gpt17",id:"b",fields:{comment:"two more"}})');
+  assert.equal(h.run('queue.length'), 2);
+  assert.equal(h.run('notesOf("gpt17").find(n=>n.id==="a").comment'), 'one more 2');
+  h.run('enqueue({type:"note-add",chapter:"gpt17",note:{id:"c",status:"open",quote:"q",comment:"new",replies:[]}})');
+  h.run('enqueue({type:"note-set",chapter:"gpt17",id:"c",fields:{comment:"new, more"}})');
+  assert.equal(h.run('pendingCount()'), 3);
+  h.run('renderStatus()');
+  assert.equal(h.elements.get('#syncText').textContent, 'Синхронизировать · 3');
 });
