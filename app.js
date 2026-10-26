@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 21; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 22; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
