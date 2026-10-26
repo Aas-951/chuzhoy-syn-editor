@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 20; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 21; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -409,6 +409,7 @@ function render() {
   $('#back').hidden = route.screen === 'chapters';
   $('#addNote').hidden = true;
   $('#nextNote').hidden = true;
+  $('#nextUnchecked').hidden = true;
   if (route.screen === 'settings') return renderSettings();
   if (!cfg.token) return renderSettings();
   if (!inChapter) return renderChapters();
@@ -519,7 +520,7 @@ function renderRead(ch) {
   v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button><button id="theme">Тема</button>${kg ? `<button id="kgToggle" aria-pressed="${ui.kg !== false}">${ui.kg !== false ? 'Кырг. ✓' : 'Кырг.'}</button>` : ''}</div>
     ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
     ${waiting ? `<div class="row"><span class="hint grow">Это текст до правок. Есть предложение от ${esc(waiting.by || 'агента')}.</span><button class="btn" id="readNew">Читать с правками</button></div>` : ''}
-    ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку или дописать её. «Заметка ↓» — к следующей заметке.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
+    ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку или дописать её. ✓ справа — абзац прочитан и устраивает. «Заметка ↓» — к следующей заметке, «Не отмечено ↓» — к следующему абзацу без галочки.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
     ${editing && loadNoteDraft(ch.id) ? '<button class="btn" id="resumeNote">Продолжить недописанную заметку</button>' : ''}
     <article class="article" id="article">${mdToHtml(text)}</article>`;
   readSize();
@@ -641,13 +642,25 @@ function annotateRead(ch) {
   const texts = blocks.map(el => el.textContent);
   const notes = liveNotes(ch).filter(n => norm(n.quote || ''));
   const located = notes.map(note => ({ note, at: locateQuote(texts, note) }));
+  const okSet = loadOk(ch.id);
   blocks.forEach((el, i) => {
     if (el.tagName !== 'P') return;
     const mine = located.filter(({ at }) => at && at.block === i);
-    const row = document.createElement('div'); row.className = 'read-row' + (mine.length ? ' noted' : '');
+    const hash = paraHash(texts[i]);
+    const row = document.createElement('div'); row.className = 'read-row' + (mine.length ? ' noted' : '') + (okSet.has(hash) ? ' ok' : '');
     const body = document.createElement('div');
     el.before(row); body.append(el); row.append(body);
     const actions = document.createElement('div'); actions.className = 'read-actions';
+    const tick = document.createElement('button'); tick.className = 'para-ok'; tick.textContent = '✓';
+    const setTick = () => { const on = row.classList.contains('ok'); tick.setAttribute('aria-pressed', on); tick.setAttribute('aria-label', on ? 'Снять отметку «прочитано»' : 'Отметить: прочитано, устраивает'); };
+    setTick();
+    tick.onclick = () => {
+      const set = loadOk(ch.id), on = !set.has(hash);
+      on ? set.add(hash) : set.delete(hash);
+      if (!save(okKey(ch.id), [...set])) return;
+      row.classList.toggle('ok', on); setTick(); updateOkCount();
+    };
+    actions.append(tick);
     const add = document.createElement('button'); add.className = 'para-add'; add.textContent = '＋';
     add.setAttribute('aria-label', 'Новая отдельная заметка к абзацу');
     add.onclick = () => noteSheet(ch, { quote: texts[i], prefix: '', suffix: '' }); actions.append(add);
@@ -669,17 +682,50 @@ function annotateRead(ch) {
     art.before(warning);
   }
   $('#nextNote').hidden = !art.querySelector('.read-row.noted');
+  const bar = document.createElement('div'); bar.className = 'row';
+  bar.innerHTML = '<span class="hint grow" id="okCount"></span><button class="btn" id="okClear" hidden>Снять все отметки</button>';
+  art.before(bar);
+  $('#okClear').onclick = () => {
+    if (!confirm('Снять все галочки «прочитано» в этой главе?')) return;
+    localStorage.removeItem(okKey(ch.id));
+    document.querySelectorAll('#article .read-row.ok').forEach(r => r.classList.remove('ok'));
+    document.querySelectorAll('#article .para-ok').forEach(b => b.setAttribute('aria-pressed', false));
+    updateOkCount();
+  };
+  updateOkCount();
 }
-// «Заметка ↓»: к следующей заметке ниже верха экрана; после последней — снова первая.
-function nextNote() {
-  const rows = [...document.querySelectorAll('#article .read-row.noted')]; if (!rows.length) return;
+// «Заметка ↓» и «Не отмечено ↓»: к следующему такому абзацу ниже верха экрана;
+// после последнего — снова первый.
+function jumpTo(selector, wrapped) {
+  const rows = [...document.querySelectorAll(selector)]; if (!rows.length) return false;
   if (notice) { notice = ''; renderBanner(); }
   const line = headerBottom() + 12;
   let next = rows.find(r => r.getBoundingClientRect().top > line);
-  if (!next) { next = rows[0]; notice = 'Это была последняя заметка, снова первая.'; renderBanner(); }
+  if (!next) { next = rows[0]; notice = wrapped; renderBanner(); }
   window.scrollBy(0, next.getBoundingClientRect().top - headerBottom() - 8);
   next.classList.add('flash'); setTimeout(() => next.classList.remove('flash'), 1700);
   rememberReading();
+  return true;
+}
+const nextNote = () => jumpTo('#article .read-row.noted', 'Это была последняя заметка, снова первая.');
+function nextUnchecked() {
+  if (!jumpTo('#article .read-row:not(.ok)', 'Ниже всё отмечено, снова первый неотмеченный абзац.')) { notice = 'Все абзацы главы отмечены.'; renderBanner(); }
+}
+
+// Галочка «прочитано, устраивает» у абзаца — только на этом телефоне. Хранится
+// по тексту абзаца: если абзац изменится, галочка с него сама снимется.
+const okKey = id => 'cs.ok.' + id;
+function paraHash(s) {
+  let h = 0x811c9dc5;
+  for (const c of norm(s)) { h ^= c.codePointAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(36);
+}
+const loadOk = id => new Set(load(okKey(id), []));
+function updateOkCount() {
+  const all = document.querySelectorAll('#article .read-row').length, ok = document.querySelectorAll('#article .read-row.ok').length;
+  const c = $('#okCount'); if (c) c.textContent = `Отмечено абзацев: ${ok} из ${all}`;
+  const clear = $('#okClear'); if (clear) clear.hidden = !ok;
+  $('#nextUnchecked').hidden = !all || ok === all;
 }
 // «Сохранить» — пока в поле есть несохранённое; после нажатия — «✓ Сохранено».
 function readNoteSheet(ch, note) {
@@ -747,6 +793,7 @@ document.addEventListener('selectionchange', () => {
 });
 $('#addNote').onclick = () => { if (selectionInfo) noteSheet(chapterById(route.chapter), selectionInfo); };
 $('#nextNote').onclick = nextNote;
+$('#nextUnchecked').onclick = nextUnchecked;
 
 const noteDraftKey = id => 'cs.noteDraft.' + id;
 function loadNoteDraft(id) {
