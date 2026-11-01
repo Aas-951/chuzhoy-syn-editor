@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 23; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 24; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -435,10 +435,10 @@ function renderChapters() {
   }
   const todo = inbox().filter(it => it.kind === 'proposal');
   v.innerHTML = `${appInfoHtml()}${chapterById(ui.lastChapter) ? `<button class="item" data-ch="${esc(ui.lastChapter)}"><div class="t">Продолжить чтение</div><div class="s">${esc(chapterById(ui.lastChapter).title)}</div></button>` : ''}${inboxHtml(todo)}
-  <div class="editions" aria-label="Редакция романа">${editions().map(e => {
+  ${editions().length < 2 ? '' : `<div class="editions" aria-label="Редакция романа">${editions().map(e => {
     const n = todo.filter(it => editionOf(it.ch) === e.id).length;
     return `<button class="btn ${e.id === edition ? 'primary' : ''}" data-edition="${esc(e.id)}" aria-pressed="${e.id === edition}">${esc(e.title)} <span class="count">${n || ''}</span></button>`;
-  }).join('')}</div>
+  }).join('')}</div>`}
   <div class="list">${list.map(ch => {
     const text = chapterText(ch);
     const on = openNotes(ch.id).length, pr = proposalsOf(ch.id).filter(p => p.status === 'pending').length;
@@ -478,7 +478,7 @@ function inboxHtml(items) {
   if (!items.length) return '<p class="hint">Новых предложений нет.</p>';
   return `<section class="inbox"><h2>Ждёт вас: ${items.length}</h2><div class="list">${items.map((it, i) => `<button class="item todo" data-inbox="${i}">
       <div class="t">${it.kind === 'proposal' ? `Предложение правок от ${esc(it.p.by || 'агента')}` : `Агент ответил на заметки: ${it.n}`}</div>
-      <div class="where">${esc(it.ch.title)} · ${esc(editionTitle(it.ch))}</div>
+      <div class="where">${esc(it.ch.title)}${editions().length < 2 ? '' : ' · ' + esc(editionTitle(it.ch))}</div>
       <div class="s">${it.kind === 'proposal' ? esc((it.p.summary || '').slice(0, 220)) : 'Прочитайте ответы, затем закройте заметку или ответьте.'}</div></button>`).join('')}</div></section>`;
 }
 function openInboxItem(it) {
@@ -1001,7 +1001,7 @@ function replySheet(ch, id) {
 async function copyAgentTask(ch, agent) {
   if (queue.some(op => op.chapter === ch.id)) return alert('Сначала нажмите «Синхронизировать» и дождитесь отправки изменений этой главы.');
   const edition = editions().find(e => e.id === editionOf(ch))?.title || editionOf(ch);
-  const text = `Работай с закрытым репозиторием ${cfg.owner}/${cfg.repo}, ветка ${branch()}. Прочитай AGENTS.md и редактор/README.md, получи свежие изменения без перезаписи чужих правок. Редакция: ${edition}. Глава: ${ch.title}, постоянный id: ${ch.id}, файл: ${ch.file}. Обсуди открытые заметки из ${notesPath(ch.id)} со мной в этом чате от имени ${agent}. Не добавляй ответы в replies. Пропускай заметки с deleted: true. По замечаниям подготовь предложение с правками по правилам README, не переписывай главу. Не меняй другую редакцию романа. Если заметка к прежнему тексту, сначала проверь актуальность. Проверь JSON, сохрани только свои изменения, выполни commit и push без force. Коротко сообщи результат.`;
+  const text = `Работай с закрытым репозиторием ${cfg.owner}/${cfg.repo}, ветка ${branch()}. Прочитай AGENTS.md и редактор/README.md, получи свежие изменения без перезаписи чужих правок. Редакция: ${edition}. Глава: ${ch.title}, постоянный id: ${ch.id}, файл: ${ch.file}. Обсуди открытые заметки из ${notesPath(ch.id)} со мной в этом чате от имени ${agent}. Не добавляй ответы в replies. Пропускай заметки с deleted: true. По замечаниям подготовь предложение с правками по правилам README, не переписывай главу. ${editions().length < 2 ? '' : 'Не меняй другую редакцию романа. '}Если заметка к прежнему тексту, сначала проверь актуальность. Проверь JSON, сохрани только свои изменения, выполни commit и push без force. Коротко сообщи результат.`;
   try { await navigator.clipboard.writeText(text); alert('Задание скопировано. Вставьте его в чат ' + agent + ' в T3.'); }
   catch {
     const d = $('#sheet');
