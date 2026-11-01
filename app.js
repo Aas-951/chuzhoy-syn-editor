@@ -19,7 +19,7 @@ const save = (k, v) => {
   catch { alert('Не удалось сохранить на телефоне. Не закрывайте редактор: скопируйте текст и освободите память.'); return false; }
 };
 
-const APP_VERSION = 22; // совпадает с номером CACHE в sw.js
+const APP_VERSION = 23; // совпадает с номером CACHE в sw.js
 let cfg = load(KEY.cfg, { owner: 'Aas-951', repo: 'chuzhoy-syn-vaal', token: '' });
 let data = load(KEY.data, { files: {}, syncedAt: null });   // files[path] = { sha, text }
 let queue = load(KEY.queue, []);
@@ -520,7 +520,7 @@ function renderRead(ch) {
   v.innerHTML = `<div class="readbar"><button id="smaller">А−</button><button id="bigger">А+</button><button id="theme">Тема</button>${kg ? `<button id="kgToggle" aria-pressed="${ui.kg !== false}">${ui.kg !== false ? 'Кырг. ✓' : 'Кырг.'}</button>` : ''}</div>
     ${pendingEdit(ch.id) ? '<p class="hint">Показана ваша правка — она ещё не отправлена.</p>' : ''}
     ${waiting ? `<div class="row"><span class="hint grow">Это текст до правок. Есть предложение от ${esc(waiting.by || 'агента')}.</span><button class="btn" id="readNew">Читать с правками</button></div>` : ''}
-    ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку или дописать её. ✓ справа — абзац прочитан и устраивает. «Заметка ↓» — к следующей заметке, «Не отмечено ↓» — к следующему абзацу без галочки.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
+    ${editing ? '<p class="hint">Нажмите на абзац, чтобы написать заметку или дописать её. ✓ справа — абзац прочитан и устраивает; у абзаца с заметкой галочки нет. «Заметка ↓» — к следующей заметке, «Не отмечено ↓» — к следующему абзацу без галочки.</p><button class="btn" id="rawEdit">Править весь текст</button>' : ''}
     ${editing && loadNoteDraft(ch.id) ? '<button class="btn" id="resumeNote">Продолжить недописанную заметку</button>' : ''}
     <article class="article" id="article">${mdToHtml(text)}</article>`;
   readSize();
@@ -643,6 +643,9 @@ function annotateRead(ch) {
   const notes = liveNotes(ch).filter(n => norm(n.quote || ''));
   const located = notes.map(note => ({ note, at: locateQuote(texts, note) }));
   const okSet = loadOk(ch.id);
+  const noted = new Set(located.filter(l => l.at).map(l => paraHash(texts[l.at.block])));
+  // Абзац с заметкой не может быть «прочитан, устраивает»: прежняя галочка снимается.
+  if ([...okSet].some(h => noted.has(h))) { noted.forEach(h => okSet.delete(h)); save(okKey(ch.id), [...okSet]); }
   blocks.forEach((el, i) => {
     if (el.tagName !== 'P') return;
     const mine = located.filter(({ at }) => at && at.block === i);
@@ -660,7 +663,8 @@ function annotateRead(ch) {
       if (!save(okKey(ch.id), [...set])) return;
       row.classList.toggle('ok', on); setTick(); updateOkCount();
     };
-    actions.append(tick);
+    row.dataset.hash = hash;
+    if (!mine.length) actions.append(tick);
     const add = document.createElement('button'); add.className = 'para-add'; add.textContent = '＋';
     add.setAttribute('aria-label', 'Новая отдельная заметка к абзацу');
     add.onclick = () => noteSheet(ch, { quote: texts[i], prefix: '', suffix: '' }); actions.append(add);
@@ -683,8 +687,16 @@ function annotateRead(ch) {
   }
   $('#nextNote').hidden = !art.querySelector('.read-row.noted');
   const bar = document.createElement('div'); bar.className = 'row';
-  bar.innerHTML = '<span class="hint grow" id="okCount"></span><button class="btn" id="okClear" hidden>Снять все отметки</button>';
+  bar.innerHTML = '<span class="hint grow" id="okCount"></span><button class="btn" id="okAll" hidden>Отметить все без заметок</button><button class="btn" id="okClear" hidden>Снять все отметки</button>';
   art.before(bar);
+  $('#okAll').onclick = () => {
+    const rows = [...document.querySelectorAll('#article .read-row:not(.noted):not(.ok)')];
+    if (!rows.length || !confirm(`Отметить «прочитано» все абзацы без заметок (${rows.length})?`)) return;
+    const set = loadOk(ch.id); rows.forEach(r => set.add(r.dataset.hash));
+    if (!save(okKey(ch.id), [...set])) return;
+    rows.forEach(r => { r.classList.add('ok'); r.querySelector('.para-ok')?.setAttribute('aria-pressed', true); });
+    updateOkCount();
+  };
   $('#okClear').onclick = () => {
     if (!confirm('Снять все галочки «прочитано» в этой главе?')) return;
     localStorage.removeItem(okKey(ch.id));
@@ -709,7 +721,7 @@ function jumpTo(selector, wrapped) {
 }
 const nextNote = () => jumpTo('#article .read-row.noted', 'Это была последняя заметка, снова первая.');
 function nextUnchecked() {
-  if (!jumpTo('#article .read-row:not(.ok)', 'Ниже всё отмечено, снова первый неотмеченный абзац.')) { notice = 'Все абзацы главы отмечены.'; renderBanner(); }
+  if (!jumpTo('#article .read-row:not(.ok):not(.noted)', 'Ниже всё отмечено, снова первый неотмеченный абзац.')) { notice = 'Все абзацы главы отмечены.'; renderBanner(); }
 }
 
 // Галочка «прочитано, устраивает» у абзаца — только на этом телефоне. Хранится
@@ -722,9 +734,11 @@ function paraHash(s) {
 }
 const loadOk = id => new Set(load(okKey(id), []));
 function updateOkCount() {
-  const all = document.querySelectorAll('#article .read-row').length, ok = document.querySelectorAll('#article .read-row.ok').length;
-  const c = $('#okCount'); if (c) c.textContent = `Отмечено абзацев: ${ok} из ${all}`;
+  const all = document.querySelectorAll('#article .read-row:not(.noted)').length, ok = document.querySelectorAll('#article .read-row.ok').length;
+  const notes = document.querySelectorAll('#article .read-row.noted').length;
+  const c = $('#okCount'); if (c) c.textContent = `Отмечено абзацев: ${ok} из ${all}` + (notes ? `, с заметками: ${notes}` : '');
   const clear = $('#okClear'); if (clear) clear.hidden = !ok;
+  const okAll = $('#okAll'); if (okAll) okAll.hidden = ok === all;
   $('#nextUnchecked').hidden = !all || ok === all;
 }
 // «Сохранить» — пока в поле есть несохранённое; после нажатия — «✓ Сохранено».
